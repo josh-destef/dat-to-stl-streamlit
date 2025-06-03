@@ -71,10 +71,9 @@ if dat_file:
         """
         x = xy[:, 0]
         y = xy[:, 1]
-        try:
-            tck, _ = splprep([x, y], s=0, per=1)
-        except Exception:
-            tck, _ = splprep([x, y], s=0, per=0)
+        # Always use non-periodic spline to preserve sharp LE corner
+        tck, _ = splprep([x, y], s=0, per=0)
+
         u_new = np.linspace(0.0, 1.0, num_pts)
         out = splev(u_new, tck)
         pts_interp = np.vstack(out).T
