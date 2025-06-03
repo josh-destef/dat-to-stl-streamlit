@@ -4,7 +4,7 @@ from scipy.interpolate import splprep, splev
 import io
 import matplotlib.pyplot as plt
 import pandas as pd
-from streamlit_3d_viewer import st_viewer
+import base64
 
 st.set_page_config(page_title="Airfoil Toolkit", layout="centered")
 st.title("Airfoil Toolkit")
@@ -253,9 +253,68 @@ with tab2:
                 stl_text = write_stl_ascii(verts, faces, solid_name=stl_name)
                 stl_bytes = stl_text.encode("utf-8")
 
-                st.markdown("**3D Preview**")
-                st_viewer(stl_bytes, file_type="stl")
+                # 1) Show 3D preview via Three.js embedded HTML
+                b64 = base64.b64encode(stl_bytes).decode()
+                html = f"""
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                  <meta charset="UTF-8" />
+                  <title>STL Preview</title>
+                  <style>
+                    body {{ margin: 0; }}
+                    #viewer {{ width: 100%; height: 400px; }}
+                  </style>
+                </head>
+                <body>
+                  <div id="viewer"></div>
+                  <script src="https://cdn.jsdelivr.net/npm/three@0.150/build/three.min.js"></script>
+                  <script src="https://cdn.jsdelivr.net/npm/three@0.150/examples/js/loaders/STLLoader.js"></script>
+                  <script>
+                    const scene = new THREE.Scene();
+                    const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
+                    const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+                    renderer.setSize(window.innerWidth, 400);
+                    document.getElementById('viewer').appendChild(renderer.domElement);
 
+                    const ambient = new THREE.AmbientLight(0x404040);
+                    scene.add(ambient);
+                    const directional = new THREE.DirectionalLight(0xffffff, 1);
+                    directional.position.set(1, 1, 1).normalize();
+                    scene.add(directional);
+
+                    const loader = new THREE.STLLoader();
+                    loader.load('data:application/sla;base64,{b64}', function (geometry) {{
+                      const material = new THREE.MeshNormalMaterial();
+                      const mesh = new THREE.Mesh(geometry, material);
+                      scene.add(mesh);
+
+                      const box = new THREE.Box3().setFromObject(mesh);
+                      const size = box.getSize(new THREE.Vector3()).length();
+                      const center = box.getCenter(new THREE.Vector3());
+
+                      mesh.position.x += (mesh.position.x - center.x);
+                      mesh.position.y += (mesh.position.y - center.y);
+                      mesh.position.z += (mesh.position.z - center.z);
+
+                      camera.position.set(center.x, center.y, size * 2);
+                      camera.lookAt(center);
+
+                      function animate() {{
+                        requestAnimationFrame(animate);
+                        mesh.rotation.x += 0.01;
+                        mesh.rotation.y += 0.01;
+                        renderer.render(scene, camera);
+                      }}
+                      animate();
+                    }});
+                  </script>
+                </body>
+                </html>
+                """
+                st.components.v1.html(html, height=420)
+
+                # 2) Download button
                 st.download_button(
                     label="Download `.stl`",
                     data=stl_bytes,

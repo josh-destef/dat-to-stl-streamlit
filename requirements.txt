@@ -3,4 +3,3 @@ numpy
 scipy
 pandas
 matplotlib
-streamlit-3d-viewer
