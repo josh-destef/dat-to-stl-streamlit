@@ -323,18 +323,52 @@ with tab2:
             # If custom, show 2D plot allowing user to move hex via sliders
             if hole_loc_method == "Custom (use 2D graph)":
                 st.markdown("**Click 'Reset to Centroid' to return to centroid.**")
-                # Default custom_x and custom_y = centroid
+                # Let the user type in the hex‐center X and Y (default = centroid):
                 custom_x = st.number_input("Hex center X-coordinate [mm]", value=float(Cx_centroid))
                 custom_y = st.number_input("Hex center Y-coordinate [mm]", value=float(Cy_centroid))
+
+                # Create the 2D preview
                 fig2, ax2 = plt.subplots(figsize=(5, 3))
-                ax2.plot(coords2[:,0], coords2[:,1], "-b", linewidth=1.5)
+                ax2.plot(coords2[:,0], coords2[:,1], "-b", linewidth=1.5, label="Foil Profile")
                 draw_hex_2d(ax2, custom_x, custom_y, hex_top_f2f)
+
+                # Compute a combined bounding box for foil and hex (top f2f)
+                # 1) Foil bounds:
+                foil_minx, foil_maxx = coords2[:,0].min(), coords2[:,0].max()
+                foil_miny, foil_maxy = coords2[:,1].min(), coords2[:,1].max()
+
+                # 2) Hex bounding box (assuming flat‐to‐flat = hex_top_f2f)
+                # The circumradius of that hex is R = (f2f/2) / cos(30°):
+                R = (hex_top_f2f / 2.0) / np.cos(np.pi/6)
+                hex_minx = custom_x - R
+                hex_maxx = custom_x + R
+                hex_miny = custom_y - R
+                hex_maxy = custom_y + R
+
+                # 3) Combine both sets of bounds:
+                overall_minx = min(foil_minx, hex_minx)
+                overall_maxx = max(foil_maxx, hex_maxx)
+                overall_miny = min(foil_miny, hex_miny)
+                overall_maxy = max(foil_maxy, hex_maxy)
+
+                # 4) Add a small 5% margin around that combined box:
+                dx = overall_maxx - overall_minx
+                dy = overall_maxy - overall_miny
+                margin_x = dx * 0.05 if dx > 0 else 1.0
+                margin_y = dy * 0.05 if dy > 0 else 1.0
+
+                ax2.set_xlim(overall_minx - margin_x, overall_maxx + margin_x)
+                ax2.set_ylim(overall_miny - margin_y, overall_maxy + margin_y)
+
                 ax2.set_aspect("equal", "box")
                 ax2.set_xlabel("x [mm]")
                 ax2.set_ylabel("y [mm]")
                 ax2.set_title("2D Airfoil with Hex Overlay (Custom Placement)")
+                ax2.legend(loc="upper right")
                 st.pyplot(fig2)
+
                 Cx, Cy = custom_x, custom_y
+
 
             elif hole_loc_method == "Centroid of foil":
                 Cx, Cy = Cx_centroid, Cy_centroid
