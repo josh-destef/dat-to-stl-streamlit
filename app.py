@@ -405,26 +405,24 @@ with tab2:
                         cx, cy, top_f2f, bot_f2f, depth, top_z=thickness
                     )
 
-                    # d) Convert both to trimesh.Trimesh with process=True
-                    foil_mesh = trimesh.Trimesh(vertices=verts_foil, faces=faces_foil, process=True)
-                    hex_mesh  = trimesh.Trimesh(vertices=verts_hex,  faces=faces_hex,  process=True)
+                    # d) Convert both to trimesh.Trimesh with process=False
+                    foil_mesh = trimesh.Trimesh(vertices=verts_foil, faces=faces_foil, process=False)
+                    hex_mesh  = trimesh.Trimesh(vertices=verts_hex,  faces=faces_hex,  process=False)
 
-                    # e) Ensure foil_mesh is watertight
+                    # e) Attempt to repair watertightness manually
                     if not foil_mesh.is_watertight:
                         fill_holes(foil_mesh)
                         fix_normals(foil_mesh)
-                    # f) Ensure hex_mesh is watertight
                     if not hex_mesh.is_watertight:
                         fill_holes(hex_mesh)
                         fix_normals(hex_mesh)
 
-                    # If either still isn’t watertight, show an error
                     if not foil_mesh.is_watertight or not hex_mesh.is_watertight:
                         st.error("Could not make meshes watertight for boolean difference. "
                                  "Try increasing mesh resolution or checking parameters.")
                         st.stop()
 
-                    # g) Perform boolean difference
+                    # f) Perform boolean difference
                     try:
                         result_mesh = foil_mesh.difference(hex_mesh)
                     except BaseException as e:
