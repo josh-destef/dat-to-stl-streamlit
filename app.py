@@ -47,8 +47,8 @@ def plot_2d_profile(coords, title="Airfoil Profile"):
     fig, ax = plt.subplots(figsize=(5, 2.5))
     ax.plot(coords[:, 0], coords[:, 1], "-k", linewidth=2)
     ax.set_aspect("equal", "box")
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
+    ax.set_xlabel("x [mm]")
+    ax.set_ylabel("y [mm]")
     ax.set_title(title)
     ax.grid(True, linestyle="--", alpha=0.4)
     return fig
@@ -93,7 +93,7 @@ def point_in_triangle(pt, a, b, c):
 
 def is_convex(prev_pt, curr_pt, next_pt):
     """
-    Return True if (prev_pt→curr_pt→next_pt) is a convex “ear” in CCW ordering.
+    Return True if (prev_pt→curr_pt→next_pt) makes a convex “ear” in CCW ordering.
     """
     v1 = prev_pt - curr_pt
     v2 = next_pt - curr_pt
@@ -245,15 +245,15 @@ def find_max_thickness_x(contour, num_samples=500):
 
 
 # -------------------------
-# 3) Build a “unit” hex prism (in Y–Z) with axis along Z at x=0
+# 3) Build a “unit” hex prism (in Y–Z) with axis along Z, top at z=depth, bottom at z=0
 # -------------------------
 
 def build_unit_hex_prism(f2f_top, f2f_bot, depth):
     """
-    Build a 12-vertex “unit” hex prism whose axis is along +Z, centered at (y=0).
-      - Top cap sits at z = depth   (flat-to-flat = f2f_top).
-      - Bottom cap sits at z = 0     (flat-to-flat = f2f_bot).
-    All x-coordinates = 0. 
+    Build a 12-vertex “unit” hex prism whose axis is along +Z at x=0, y=0:
+      - Top cap sits at z = depth  (flat-to-flat = f2f_top).
+      - Bottom cap sits at z = 0    (flat-to-flat = f2f_bot).
+    All x-coordinates = 0, all y‐coordinates centered at 0.
     Returns:
       • verts_hex (12×3)
       • faces_hex (12×3) of triangle indices:
@@ -271,27 +271,29 @@ def build_unit_hex_prism(f2f_top, f2f_bot, depth):
             pts.append([0.0, y, z])
         return np.array(pts, dtype=float)
 
-    top_pts = hex_corners(f2f_top, 0.0, depth)  # indices [0..5]
-    bot_pts = hex_corners(f2f_bot, 0.0, 0.0)     # indices [6..11]
+    # Build 6 corners at top (z=depth), 6 at bottom (z=0)
+    top_pts = hex_corners(f2f_top, 0.0, depth)  # indices 0..5
+    bot_pts = hex_corners(f2f_bot, 0.0, 0.0)     # indices 6..11
 
     verts_hex = np.vstack([top_pts, bot_pts])  # (12×3)
 
     faces = []
-    # 1) Side-walls: each i=0..5 → quad between top[i], top[i+1], bot[i+1], bot[i]
+    # Side walls: for i=0..5, quad between top[i], top[i+1], bot[i+1], bot[i]
     for i in range(6):
         i_next = (i + 1) % 6
         top_i = i
         top_inext = i_next
         bot_i = 6 + i
         bot_inext = 6 + i_next
+        # Split that quad into two triangles:
         faces.append([top_i, top_inext, bot_inext])
         faces.append([top_i, bot_inext, bot_i])
 
-    # 2) Top hex cap: fan around vertex 0 (indices 0..5) → (0,1,2),(0,2,3),(0,3,4),(0,4,5)
+    # Top cap: fan around vertex 0  → (0,1,2), (0,2,3), (0,3,4), (0,4,5)
     for i in range(1, 5):
         faces.append([0, i, i + 1])
 
-    # 3) Bottom hex cap: fan around vertex 6 (indices 6..11) → (6,7,8),(6,8,9),(6,9,10),(6,10,11)
+    # Bottom cap: fan around vertex 6 → (6,7,8), (6,8,9), (6,9,10), (6,10,11)
     for corner in range(7, 11):
         faces.append([6, corner, corner + 1])
 
@@ -299,31 +301,36 @@ def build_unit_hex_prism(f2f_top, f2f_bot, depth):
 
 
 # -------------------------
-# 4) Slice-and-Insert Hex in the existing mesh
+# 4) Slice–and–Insert Hex into the existing mesh
 # -------------------------
 
-def slice_and_insert_hex(verts, faces, x_center, y_center, f2f_top, f2f_bot, depth):
+def slice_and_insert_hex(verts, faces, x_center, y_center, f2f_top, f2f_bot, depth, thickness):
     """
-    1) Identify vertices whose |x - x_center| < tol and |y - y_center| < tol 
-       and whose 0 ≤ z ≤ depth. Those go into slice_verts.  
-    2) Remove every triangle that references any vertex in slice_verts → keep_faces.  
-    3) Build a “unit” hex prism at x=0 from z=0..depth using build_unit_hex_prism(f2f_top,f2f_bot,depth).  
-    4) Translate that prism’s vertices to x = x_center, y = y_center.  
-    5) Append the 12 new hex vertices to the original vertex list, re-index hex faces by +n_old.  
+    1) Identify any vertex whose |x - x_center| < tol, |y - y_center| < tol,
+       and whose z is within [thickness - depth, thickness]. Those all get removed.
+    2) Remove every triangle (face) that references any such vertex → keep_faces.
+    3) Build a “unit” hex prism (in Y–Z) from z=0..depth via build_unit_hex_prism(f2f_top,f2f_bot,depth).
+    4) Translate that prism’s vertices to:
+         x = x_center,
+         y = y_center,
+         z = (thickness - depth) + (unit_z).
+       (So its bottom cap sits at z = thickness - depth, top cap at z = thickness.)
+    5) Append those 12 new vertices to the original vertex list, re-index hex faces by +n_old.
     6) Return combined (verts_new, faces_new).
     """
     tol = 1e-6
 
-    # a) Which vertices to remove?
+    # a) Which vertices lie in the small vertical column around (x_center,y_center) from z=thickness-depth..thickness?
+    z_coords = verts[:, 2]
     mask_slice = (
         (np.abs(verts[:, 0] - x_center) < tol) &
         (np.abs(verts[:, 1] - y_center) < tol) &
-        (verts[:, 2] >= 0.0 - tol) &
-        (verts[:, 2] <= depth + tol)
+        (z_coords >= (thickness - depth) - tol) &
+        (z_coords <= (thickness + tol))
     )
     slice_verts = np.nonzero(mask_slice)[0]
 
-    # b) Keep only faces that do NOT reference any slice_vert
+    # b) Remove all faces that reference any slice_vert
     keep_faces = []
     for tri in faces:
         if any(v in slice_verts for v in tri):
@@ -331,22 +338,24 @@ def slice_and_insert_hex(verts, faces, x_center, y_center, f2f_top, f2f_bot, dep
         keep_faces.append(tri)
     keep_faces = np.array(keep_faces, dtype=int)
 
-    # c) Build “unit” hex prism (x=0) from z=0..depth
+    # c) Build “unit” hex prism (z from 0..depth, x=0, y=0)
     verts_hex_unit, faces_hex_unit = build_unit_hex_prism(f2f_top, f2f_bot, depth)
 
-    # d) Translate hex vertices to (x_center, y_center)
+    # d) Translate hex prism so its bottom cap is at z = thickness - depth,
+    #    i.e. add (thickness - depth) to each unit_z, and shift x->x_center, y->y_center
     verts_hex = verts_hex_unit.copy()
     verts_hex[:, 0] += x_center
     verts_hex[:, 1] += y_center
+    verts_hex[:, 2] += (thickness - depth)
 
     # e) Append hex vertices
     n_old = verts.shape[0]
     verts_new = np.vstack([verts, verts_hex])  # now size = n_old + 12
 
-    # f) Re-index hex faces by +n_old
+    # f) Re‐index hex faces by + n_old
     faces_hex = faces_hex_unit + n_old
 
-    # g) Combine
+    # g) Combine the kept original faces + new hex faces
     faces_new = np.vstack([keep_faces, faces_hex])
 
     return verts_new, faces_new
@@ -377,12 +386,11 @@ with tab1:
 
 
 # -------------------------
-# 6) TAB 2: Extrude to STL with Interactive 2D “Spot–Click”
+# 6) TAB 2: Extrude to STL + Drill Hex Hole (Corrected)
 # -------------------------
 with tab2:
     st.header("Extrude Airfoil to STL + Drill Hex Hole")
 
-    # 1) File upload
     dat_file_e = st.file_uploader(
         "Upload `.dat` for extrusion (first line is description)", 
         type=["dat"], key="extrude"
@@ -395,7 +403,7 @@ with tab2:
         if coords_e.shape[0] < 3:
             st.error("Failed to parse enough points. Please upload a valid airfoil DAT.")
         else:
-            # 2) Main parameters
+            # 1) Main parameters
             st.subheader("Parameters")
             col1, col2 = st.columns(2)
             with col1:
@@ -411,8 +419,8 @@ with tab2:
                     format="%.3f"
                 )
 
-            # 3) Show bounding‐box in (X,Y,Z)
-            st.subheader("Airfoil Bounding‐Box (X, Y, Z)")
+            # 2) Show bounding‐box in (X, Y, Z)
+            st.subheader("Airfoil Bounding-Box (X, Y, Z)")
             xs_scaled = coords_e[:, 0] * scale_factor
             ys_scaled = coords_e[:, 1] * scale_factor
             x_min, x_max = float(xs_scaled.min()), float(xs_scaled.max())
@@ -422,7 +430,7 @@ with tab2:
             st.write(f"• Y span: {y_max - y_min:.3f} mm (from {y_min:.3f} to {y_max:.3f})")
             st.write(f"• Z span: {z_max - z_min:.3f} mm")
 
-            # 4) Optional: 2D resampled preview
+            # 3) Optional: 2D resampled preview
             st.subheader("Optional: Resampled Preview")
             num_pts = st.slider(
                 "Resample points for smoothness",
@@ -433,7 +441,7 @@ with tab2:
             fig_e = plot_2d_profile(contour_preview, title="Resampled & Scaled (Preview)")
             st.pyplot(fig_e)
 
-            # 5) Let user choose (x_center, y_center) via sliders, show a red dot
+            # 4) Let user choose (x_center, y_center) via sliders, show a red dot
             st.subheader("Choose `x` and `y` for the Hex Center (in mm)")
             x_choice = st.slider(
                 "Hole center X [mm]", min_value=x_min, max_value=x_max,
@@ -456,7 +464,7 @@ with tab2:
             ax2.legend()
             st.pyplot(fig2)
 
-            # 6) Tapered‐hex parameters & depth
+            # 5) Tapered‐hex parameters & depth
             st.subheader("Tapered-Hex Hole Parameters")
             colht, colhb, cold = st.columns(3)
             with colht:
@@ -475,7 +483,7 @@ with tab2:
                     min_value=0.0, max_value=thickness, value=thickness, step=0.1
                 )
 
-            # 7) Generate & Preview final STL
+            # 6) Generate & Preview final STL
             st.subheader("Generate & Preview STL")
             stl_name = st.text_input("Filename (no extension)", value="airfoil_extrusion")
             if not stl_name.strip():
@@ -487,7 +495,7 @@ with tab2:
                         scaled_coords, thickness, num_interp=num_pts
                     )
 
-                    # b) Remove a tiny vertical column around (x_choice, y_choice) from z=0..depth
+                    # b) Remove + Insert hex from z = thickness - depth .. thickness
                     verts_mod, faces_mod = slice_and_insert_hex(
                         verts_foil,
                         faces_foil,
@@ -495,7 +503,8 @@ with tab2:
                         y_center=y_choice,
                         f2f_top=top_f2f,
                         f2f_bot=bot_f2f,
-                        depth=depth
+                        depth=depth,
+                        thickness=thickness
                     )
 
                     # c) Generate ASCII STL text
