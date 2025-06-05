@@ -5,11 +5,17 @@ import io
 import matplotlib.pyplot as plt
 import pandas as pd
 import base64
+import struct
 
 st.set_page_config(page_title="Airfoil Toolkit", layout="centered")
 st.title("Airfoil Toolkit")
 
-tab1, tab2 = st.tabs(["View Airfoil", "Extrude to STL"])
+# Three tabs: 
+#  - tab1 = “View Airfoil”
+#  - tab2 = “Extrude to STL”
+#  - tab3 = “Modify Existing STL”
+
+tab1, tab2, tab3 = st.tabs(["View Airfoil", "Extrude to STL", "Modify Existing STL"])
 
 
 # -------------------------
@@ -104,8 +110,7 @@ def is_convex(prev_pt, curr_pt, next_pt):
 
 def triangulate_polygon(contour_xy):
     """
-    Ear‐clipping triangulation for a CCW 2D contour.
-    Returns a list of index‐triples (i, j, k).
+    Ear‐clipping triangulation for a CCW 2D contour. Returns a list of index‐triples (i, j, k).
     """
     n = len(contour_xy)
     if n < 3:
@@ -148,7 +153,7 @@ def triangulate_polygon(contour_xy):
 
 def extrude_to_vertices_faces(xy_points, thickness_mm, num_interp=200):
     """
-    1) Resample xy_points to num_interp via spline (smooth contour).  
+    1) Resample xy_points to num_interp (smooth contour).  
     2) Build a 3D “plate” with bottom at z=0 and top at z=thickness_mm.  
     3) Triangulate the 2D contour for bottom & top caps.  
     4) Add side‐wall faces.  
@@ -183,7 +188,7 @@ def extrude_to_vertices_faces(xy_points, thickness_mm, num_interp=200):
 
 def write_stl_ascii(vertices, faces, solid_name="airfoil_extrusion"):
     """
-    Write an ASCII STL string from (vertices, faces). Return as a single string.
+    Write an ASCII STL string from (vertices, faces). Return as one string.
     """
     def compute_normal(v1, v2, v3):
         n = np.cross(v2 - v1, v3 - v1)
@@ -211,14 +216,14 @@ def write_stl_ascii(vertices, faces, solid_name="airfoil_extrusion"):
 
 
 # -------------------------
-# 2) Find chordwise station of max thickness
+# 2) Find the chordwise station of maximum thickness
 # -------------------------
 
 def find_max_thickness_x(contour, num_samples=500):
     """
-    Given a 2D contour (N×2), sample num_samples x-values from min(x) to max(x).
-    For each xg, find polygon intersections with x=xg, compute vertical thickness = max(Y)-min(Y),
-    return the xg that maximizes that thickness.
+    Given a 2D contour (N×2), sample num_samples x-values between min(x) and max(x).
+    For each xg, find where the polygon intersects the vertical line x=xg.
+    Compute vertical thickness = max(Y)-min(Y). Return the xg that maximizes that thickness.
     """
     xs = contour[:, 0]
     minx, maxx = xs.min(), xs.max()
@@ -252,13 +257,13 @@ def find_max_thickness_x(contour, num_samples=500):
 
 def build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness):
     """
-    Build a 12‐vertex unit hex prism (axis along z, centered at y=0).  
-      - Top cap (z = thickness) has flat‐to‐flat = f2f_top.  
-      - Bottom cap (z = thickness - depth) has flat‐to‐flat = f2f_bot.  
-    Each vertex format: [x=0, y, z].  
+    Build a 12‐vertex unit hex prism whose axis is along +Z, all at x=0:
+      - The top cap (z = thickness) has flat‐to‐flat = f2f_top.
+      - The bottom cap (z = thickness - depth) has flat‐to‐flat = f2f_bot.
+    Each vertex is [0, y, z].  
     Returns (verts_hex, faces_hex):
       • verts_hex is shape (12×3).  
-      • faces_hex is shape (12, 3) of triangle indices:
+      • faces_hex is shape (12,3) of triangle indices:
         – 6 quads for side walls → 12 triangles  
         – 4 triangles for top cap  
         – 4 triangles for bottom cap  
@@ -289,15 +294,14 @@ def build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness):
         top_inext = i_next
         bot_i = 6 + i
         bot_inext = 6 + i_next
-        # split that quad into two triangles:
         faces.append([top_i, top_inext, bot_inext])
         faces.append([top_i, bot_inext, bot_i])
 
-    # 2) Top hex cap: fan around vertex 0 (top) → (0,1,2), (0,2,3), (0,3,4), (0,4,5)
+    # 2) Top hex cap: fan around vertex 0 (indices [0..5]): (0,1,2),(0,2,3),(0,3,4),(0,4,5)
     for i in range(1, 5):
         faces.append([0, i, i + 1])
 
-    # 3) Bottom hex cap: fan around vertex 6 (bottom) → (6,7,8), (6,8,9), (6,9,10), (6,10,11)
+    # 3) Bottom hex cap: fan around vertex 6 (indices [6..11]): (6,7,8),(6,8,9),(6,9,10),(6,10,11)
     for corner in range(7, 11):
         faces.append([6, corner, corner + 1])
 
@@ -305,61 +309,145 @@ def build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness):
 
 
 # -------------------------
-# 4) Slice‐and‐Insert Hex
+# 4) “Slice‐and‐Insert Hex” on an existing mesh
 # -------------------------
 
-def slice_and_insert_hex(verts, faces, x_slice, f2f_top, f2f_bot, depth):
+def slice_and_insert_hex(verts, faces, x_center, f2f_top, f2f_bot, depth, z_center):
     """
-    1) Identify any face whose triangle crosses x=x_slice (or lies entirely on that plane within tol). Remove it.
-    2) Build a 12‐vertex unit hex prism at x=0 (in Y–Z) via build_unit_hex_prism.
-    3) Translate that unit hex to x = x_slice.
-    4) Append hex vertices and reindex hex faces.
-    5) Return the combined (verts_new, faces_new).
+    1) Identify all vertices whose |x - x_center| < tol AND |z - z_center| < (depth/2). 
+       Collect their indices in slice_verts.  
+    2) Remove any face that references any of slice_verts → keep_faces.  
+    3) Build a “unit” tapered hex prism centered in Y–Z:
+         - Top cap at z = z_center + (depth/2), flat‐to‐flat = f2f_top
+         - Bottom cap at z = z_center - (depth/2), flat‐to‐flat = f2f_bot
+       (This prism has 12 vertices at x=0.)
+    4) Translate that prism’s vertices to x = x_center (so that the hex is drilled through).
+    5) Append the 12 hex‐verts to the original vertices array.
+    6) Reindex the 8 hex faces by adding n_old = len(verts) (since they come after).
+    7) Return (verts_new, faces_new) where:
+         verts_new  = np.vstack([verts, verts_hex_translated])  
+         faces_new  = np.vstack([keep_faces, faces_hex_reindexed])
     """
-    thickness = np.max(verts[:, 2])  # should equal the extrusion thickness
-    tol = 1e-3  # tolerance in mm to catch faces “on” the slice
+    thickness = np.max(verts[:, 2])
+    tol = 1e-6
 
+    # a) Collect any vertex within the tolerance window around x_center and z_center
+    x_coords = verts[:, 0]
+    z_coords = verts[:, 2]
+    mask_slice = (np.abs(x_coords - x_center) < tol) & \
+                 (np.abs(z_coords - z_center) < (depth / 2.0 + tol))
+    slice_verts = np.nonzero(mask_slice)[0]
+
+    # b) Remove faces that reference ANY slice_vert
     keep_faces = []
     for tri in faces:
-        xs = verts[tri, 0]
-        x_min = xs.min()
-        x_max = xs.max()
-
-        # Remove if this triangle crosses x_slice (strictly between)
-        if (x_min < x_slice - tol and x_max > x_slice + tol):
+        if any(v in slice_verts for v in tri):
             continue
-
-        # Remove if all three vertices lie within tol of x_slice (to avoid tiny slivers)
-        if all(abs(xi - x_slice) < tol for xi in xs):
-            continue
-
-        # Otherwise, keep the face
         keep_faces.append(tri)
-
     keep_faces = np.array(keep_faces, dtype=int)
 
-    # Build a “unit” hex prism at x=0 in Y–Z
-    verts_hex_unit, faces_hex_unit = build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness)
+    # c) Build “unit” hex prism at x=0 in Y–Z, but centered around z_center:
+    #    We want top cap at z_top = z_center + (depth/2), bottom cap at z_bot = z_center - (depth/2).
+    #    So call build_unit_hex_prism with:
+    f2f_top_actual = f2f_top
+    f2f_bot_actual = f2f_bot
+    # But build_unit_hex_prism assumes top cap at z = thickness, bottom at z = thickness - depth.
+    # So we temporarily “trick” it by passing (depth, thickness) = (depth, (z_center + depth/2)) 
+    # so that: 
+    #   top_z = (z_center + depth/2),
+    #   bottom_z = (z_center + depth/2) - depth = z_center - (depth/2).
+    #
+    z_temp_top = z_center + depth / 2.0
+    z_temp_thickness = z_temp_top
+    verts_hex_unit, faces_hex_unit = build_unit_hex_prism(
+        f2f_top_actual, f2f_bot_actual, depth, z_temp_thickness
+    )
 
-    # Translate the hex prism so its center‐plane is x = x_slice
+    # d) Translate hex‐unit verts from x=0 to x=x_center
     verts_hex = verts_hex_unit.copy()
-    verts_hex[:, 0] += x_slice
+    verts_hex[:, 0] += x_center
 
-    # Append the new hex vertices onto the original vertices
+    # e) Append hex verts to the original verts
     n_old = verts.shape[0]
-    verts_new = np.vstack([verts, verts_hex])  # shape → (n_old + 12) × 3
+    verts_new = np.vstack([verts, verts_hex])  # size = n_old + 12
 
-    # Reindex the hex faces by offsetting each index by n_old
+    # f) Reindex hex faces (+ n_old) so they refer to the new vertices
     faces_hex = faces_hex_unit + n_old
 
-    # Combine the kept foil faces with the new hex faces
+    # g) Combine the kept original faces + new hex faces
     faces_new = np.vstack([keep_faces, faces_hex])
 
     return verts_new, faces_new
 
 
 # -------------------------
-# 5) TAB 1: View Airfoil
+# 5) Lightweight STL loader (ASCII or Binary)
+# -------------------------
+
+def load_stl_mesh(stl_bytes):
+    """
+    Minimal STL loader that handles both ASCII and binary.
+    Returns (vertices (V×3), faces (F×3)) as NumPy arrays.
+    """
+    header = stl_bytes[:80]
+    try:
+        # If the header does NOT start with “solid”, treat as binary
+        if not header.lstrip().lower().startswith(b"solid"):
+            # Attempt binary parsing
+            #  - Byte 80..84 is the unsigned int # of triangles
+            num_tris = struct.unpack("<I", stl_bytes[80:84])[0]
+            # Each triangle: 50 bytes (12 floats + 2‐byte attribute)
+            expected_len = 84 + num_tris * 50
+            if len(stl_bytes) < expected_len:
+                raise ValueError
+            data = stl_bytes[84:84 + num_tris * 50]
+            vertices = []
+            faces = []
+            offset = 0
+            for i in range(num_tris):
+                # skip normal (3 floats)
+                offset += 12
+                v0 = struct.unpack("<3f", data[offset:offset + 12]); offset += 12
+                v1 = struct.unpack("<3f", data[offset:offset + 12]); offset += 12
+                v2 = struct.unpack("<3f", data[offset:offset + 12]); offset += 12
+                vertices.append(v0)
+                vertices.append(v1)
+                vertices.append(v2)
+                faces.append([3 * i, 3 * i + 1, 3 * i + 2])
+                # skip attribute short
+                offset += 2
+            verts_np = np.array(vertices, dtype=float)
+            faces_np = np.array(faces, dtype=int)
+            return verts_np, faces_np
+    except Exception:
+        # Fall through to ASCII parse
+        pass
+
+    # ASCII parsing: read lines, collect “vertex x y z”
+    text = stl_bytes.decode("utf-8", errors="ignore").splitlines()
+    verts_list = []
+    faces_list = []
+    tri_verts = []
+    for line in text:
+        line = line.strip().lower()
+        if line.startswith("vertex"):
+            parts = line.split()
+            if len(parts) == 4:
+                x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                tri_verts.append((x, y, z))
+                if len(tri_verts) == 3:
+                    # Add these three vertices & a new face
+                    start_idx = len(verts_list)
+                    verts_list.extend(tri_verts)
+                    faces_list.append([start_idx, start_idx + 1, start_idx + 2])
+                    tri_verts = []
+    verts_np = np.array(verts_list, dtype=float)
+    faces_np = np.array(faces_list, dtype=int)
+    return verts_np, faces_np
+
+
+# -------------------------
+# 6) TAB 1: View Airfoil
 # -------------------------
 with tab1:
     st.header("View Airfoil Profile")
@@ -383,11 +471,10 @@ with tab1:
 
 
 # -------------------------
-# 6) TAB 2: Extrude to STL + Slice‐&‐Rebuild
+# 7) TAB 2: Extrude to STL
 # -------------------------
 with tab2:
-    st.header("Extrude Airfoil to STL with Tapered Hex Hole")
-
+    st.header("Extrude Airfoil to STL")
     dat_file_e = st.file_uploader(
         "Upload `.dat` for extrusion (first line is description)", 
         type=["dat"], key="extrude"
@@ -399,9 +486,7 @@ with tab2:
         if coords_e.shape[0] < 3:
             st.error("Failed to parse enough points. Please upload a valid airfoil DAT.")
         else:
-            # ——————————————
             # Parameters
-            # ——————————————
             st.subheader("Parameters")
             col1, col2 = st.columns(2)
             with col1:
@@ -417,9 +502,7 @@ with tab2:
                     format="%.3f"
                 )
 
-            # ——————————————
             # Bounding‐Box Preview
-            # ——————————————
             st.subheader("Airfoil Bounding-Box (X, Y, Z)")
             xs_scaled = coords_e[:, 0] * scale_factor
             ys_scaled = coords_e[:, 1] * scale_factor
@@ -430,9 +513,7 @@ with tab2:
             st.write(f"• Y span: {y_max - y_min:.3f} mm   (from {y_min:.3f} to {y_max:.3f})")
             st.write(f"• Z span: {z_max - z_min:.3f} mm")
 
-            # ——————————————
             # Optional: Resampled Preview
-            # ——————————————
             st.subheader("Optional: Resampled Preview")
             num_pts = st.slider(
                 "Resample points for smoothness",
@@ -443,137 +524,295 @@ with tab2:
             fig_e = plot_2d_profile(contour_preview, title="Resampled & Scaled (Preview)")
             st.pyplot(fig_e)
 
-            # ——————————————
-            # Hex‐Hole Parameters
-            # ——————————————
-            st.subheader("Tapered Hex‐Hole Parameters")
-            col1h, col2h, col3h = st.columns(3)
-            with col1h:
-                top_f2f = st.number_input(
-                    "Hexagon TOP flat-to-flat (mm)",
-                    min_value=0.5, value=5.0, step=0.1
-                )
-            with col2h:
-                bot_f2f = st.number_input(
-                    "Hexagon BOTTOM flat-to-flat (mm)",
-                    min_value=0.1, value=4.8, step=0.1
-                )
-            with col3h:
-                depth = st.number_input(
-                    "Hexagon hole DEPTH (mm)",
-                    min_value=0.1, max_value=thickness, value=thickness, step=0.1
-                )
-
-            # ——————————————
             # Generate & Preview STL
-            # ——————————————
             st.subheader("Generate & Preview STL")
             stl_name = st.text_input("Filename (no extension)", value="airfoil_extrusion")
             if not stl_name.strip():
                 st.error("Please enter a valid filename.")
             else:
-                if st.button("Create STL with Hex Hole"):
-                    # 1) Build the extruded foil mesh
-                    verts_foil, faces_foil = extrude_to_vertices_faces(
-                        scaled_coords, thickness, num_interp=num_pts
+                if st.button("Create STL"):
+                    verts, faces = extrude_to_vertices_faces(scaled_coords, thickness, num_interp=num_pts)
+                    stl_text = write_stl_ascii(verts, faces, solid_name=stl_name)
+                    stl_bytes = stl_text.encode("utf-8")
+
+                    # Three.js Preview via embedded HTML
+                    b64 = base64.b64encode(stl_bytes).decode()
+                    html = f"""
+                    <!DOCTYPE html>
+                    <html lang="en">
+                    <head>
+                      <meta charset="UTF-8" />
+                      <title>STL Preview</title>
+                      <style>
+                        body {{ margin: 0; }}
+                        #viewer {{ width: 100%; height: 400px; }}
+                      </style>
+                    </head>
+                    <body>
+                      <div id="viewer"></div>
+                      <script src="https://cdn.jsdelivr.net/npm/three@0.150/build/three.min.js"></script>
+                      <script src="https://cdn.jsdelivr.net/npm/three@0.150/examples/js/loaders/STLLoader.js"></script>
+                      <script>
+                        const scene = new THREE.Scene();
+                        const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
+                        const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+                        renderer.setSize(window.innerWidth, 400);
+                        document.getElementById('viewer').appendChild(renderer.domElement);
+
+                        const ambient = new THREE.AmbientLight(0x404040);
+                        scene.add(ambient);
+                        const directional = new THREE.DirectionalLight(0xffffff, 1);
+                        directional.position.set(1, 1, 1).normalize();
+                        scene.add(directional);
+
+                        const loader = new THREE.STLLoader();
+                        loader.load('data:application/sla;base64,{b64}', function (geometry) {{
+                          const material = new THREE.MeshNormalMaterial();
+                          const mesh = new THREE.Mesh(geometry, material);
+                          scene.add(mesh);
+
+                          const box = new THREE.Box3().setFromObject(mesh);
+                          const size = box.getSize(new THREE.Vector3()).length();
+                          const center = box.getCenter(new THREE.Vector3());
+
+                          mesh.position.x += (mesh.position.x - center.x);
+                          mesh.position.y += (mesh.position.y - center.y);
+                          mesh.position.z += (mesh.position.z - center.z);
+
+                          camera.position.set(center.x, center.y, size * 2);
+                          camera.lookAt(center);
+
+                          function animate() {{
+                            requestAnimationFrame(animate);
+                            mesh.rotation.x += 0.01;
+                            mesh.rotation.y += 0.01;
+                            renderer.render(scene, camera);
+                          }}
+                          animate();
+                        }});
+                      </script>
+                    </body>
+                    </html>
+                    """
+                    st.components.v1.html(html, height=420)
+
+                    # Download button
+                    st.download_button(
+                        label="Download `.stl`",
+                        data=stl_bytes,
+                        file_name=f"{stl_name}.stl",
+                        mime="application/vnd.ms-pki.stl"
                     )
-
-                    # 2) Find the unscaled x at max thickness
-                    unscaled_contour = resample_profile_xy(coords_e, num_pts)
-                    x_unscaled_max = find_max_thickness_x(unscaled_contour, num_samples=500)
-                    cx = x_unscaled_max * scale_factor
-                    cy = 0.0
-
-                    # 3) Slice‐and‐Rebuild
-                    verts_final, faces_final = slice_and_insert_hex(
-                        verts_foil, faces_foil,
-                        x_slice=cx,
-                        f2f_top=top_f2f,
-                        f2f_bot=bot_f2f,
-                        depth=depth
-                    )
-
-                    # Inform user where the hole was placed
-                    st.info(
-                        f"Unscaled thickest station: x = {x_unscaled_max:.6f}  →  "
-                        f"Scaled center at {cx:.3f} mm"
-                    )
-
-                    if verts_final.size == 0 or faces_final.size == 0:
-                        st.error("Something went wrong (resulting mesh is empty).")
-                    else:
-                        # 4) Generate ASCII STL text
-                        stl_text = write_stl_ascii(verts_final, faces_final, solid_name=stl_name)
-                        stl_bytes = stl_text.encode("utf-8")
-
-                        # 5) Three.js Preview (identical to before)
-                        b64 = base64.b64encode(stl_bytes).decode()
-                        html = f"""
-                        <!DOCTYPE html>
-                        <html lang="en">
-                        <head>
-                          <meta charset="UTF-8" />
-                          <title>STL Preview</title>
-                          <style>
-                            body {{ margin: 0; }}
-                            #viewer {{ width: 100%; height: 400px; }}
-                          </style>
-                        </head>
-                        <body>
-                          <div id="viewer"></div>
-                          <script src="https://cdn.jsdelivr.net/npm/three@0.150/build/three.min.js"></script>
-                          <script src="https://cdn.jsdelivr.net/npm/three@0.150/examples/js/loaders/STLLoader.js"></script>
-                          <script>
-                            const scene = new THREE.Scene();
-                            const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
-                            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
-                            renderer.setSize(window.innerWidth, 400);
-                            document.getElementById('viewer').appendChild(renderer.domElement);
-
-                            const ambient = new THREE.AmbientLight(0x404040);
-                            scene.add(ambient);
-                            const directional = new THREE.DirectionalLight(0xffffff, 1);
-                            directional.position.set(1, 1, 1).normalize();
-                            scene.add(directional);
-
-                            const loader = new THREE.STLLoader();
-                            loader.load('data:application/sla;base64,{b64}', function (geometry) {{
-                              const material = new THREE.MeshNormalMaterial();
-                              const mesh = new THREE.Mesh(geometry, material);
-                              scene.add(mesh);
-
-                              const box = new THREE.Box3().setFromObject(mesh);
-                              const size = box.getSize(new THREE.Vector3()).length();
-                              const center = box.getCenter(new THREE.Vector3());
-
-                              mesh.position.x += (mesh.position.x - center.x);
-                              mesh.position.y += (mesh.position.y - center.y);
-                              mesh.position.z += (mesh.position.z - center.z);
-
-                              camera.position.set(center.x, center.y, size * 2);
-                              camera.lookAt(center);
-
-                              function animate() {{
-                                requestAnimationFrame(animate);
-                                mesh.rotation.x += 0.01;
-                                mesh.rotation.y += 0.01;
-                                renderer.render(scene, camera);
-                              }}
-                              animate();
-                            }});
-                          </script>
-                        </body>
-                        </html>
-                        """
-                        st.components.v1.html(html, height=420)
-
-                        # 6) Download button
-                        st.download_button(
-                            label="Download `.stl`",
-                            data=stl_bytes,
-                            file_name=f"{stl_name}.stl",
-                            mime="application/vnd.ms-pki.stl"
-                        )
-                        st.success(f"STL `{stl_name}.stl` is ready!")
+                    st.success(f"STL `{stl_name}.stl` is ready!")
     else:
         st.info("Upload a `.dat` file to enable extrusion.")
+
+
+# -------------------------
+# 8) TAB 3: Modify Existing STL
+# -------------------------
+with tab3:
+    st.header("Modify an Existing STL: Drill a Tapered Hex Hole")
+
+    st.markdown(
+        """
+        1. Upload an existing `.stl` file (ASCII or binary).  
+        2. Preview it.  
+        3. Specify the exact `(x, y, z)` center in **mm** where you want to cut a hex hole.  
+        4. Enter the hex parameters (top‐flat, bottom‐flat, depth).  
+        5. Click **“Cut Hex Hole”** → you’ll get a final 3D preview and can download the modified STL.
+        """
+    )
+
+    st.subheader("Step 1: Upload an STL")
+    stl_file = st.file_uploader(
+        "Upload a `.stl` file to modify", 
+        type=["stl"], key="modify_stl"
+    )
+
+    if stl_file:
+        raw_stl = stl_file.read()
+        try:
+            verts_orig, faces_orig = load_stl_mesh(raw_stl)
+        except Exception as e:
+            st.error(f"Failed to parse STL: {e}")
+            st.stop()
+
+        # Step 2: Preview original STL
+        st.subheader("Original STL Preview")
+        stl_bytes_orig = raw_stl  # raw bytes
+        b64_orig = base64.b64encode(stl_bytes_orig).decode()
+        html_preview = f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+          <meta charset="UTF-8" />
+          <title>Original STL Preview</title>
+          <style>
+            body {{ margin: 0; }}
+            #viewer {{ width: 100%; height: 300px; }}
+          </style>
+        </head>
+        <body>
+          <div id="viewer"></div>
+          <script src="https://cdn.jsdelivr.net/npm/three@0.150/build/three.min.js"></script>
+          <script src="https://cdn.jsdelivr.net/npm/three@0.150/examples/js/loaders/STLLoader.js"></script>
+          <script>
+            const scene = new THREE.Scene();
+            const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
+            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+            renderer.setSize(window.innerWidth, 300);
+            document.getElementById('viewer').appendChild(renderer.domElement);
+
+            const ambient = new THREE.AmbientLight(0x404040);
+            scene.add(ambient);
+            const directional = new THREE.DirectionalLight(0xffffff, 1);
+            directional.position.set(1, 1, 1).normalize();
+            scene.add(directional);
+
+            const loader = new THREE.STLLoader();
+            loader.load('data:application/sla;base64,{b64_orig}', function (geometry) {{
+              const material = new THREE.MeshNormalMaterial();
+              const mesh = new THREE.Mesh(geometry, material);
+              scene.add(mesh);
+
+              const box = new THREE.Box3().setFromObject(mesh);
+              const size = box.getSize(new THREE.Vector3()).length();
+              const center = box.getCenter(new THREE.Vector3());
+
+              mesh.position.x += (mesh.position.x - center.x);
+              mesh.position.y += (mesh.position.y - center.y);
+              mesh.position.z += (mesh.position.z - center.z);
+
+              camera.position.set(center.x, center.y, size * 2);
+              camera.lookAt(center);
+
+              function animate() {{
+                requestAnimationFrame(animate);
+                mesh.rotation.x += 0.005;
+                mesh.rotation.y += 0.005;
+                renderer.render(scene, camera);
+              }}
+              animate();
+            }});
+          </script>
+        </body>
+        </html>
+        """
+        st.components.v1.html(html_preview, height=320)
+
+        # Step 3: Get (x, y, z) center of the hex hole
+        st.subheader("Step 3: Specify Hole Center (mm)")
+        colx, coly, colz = st.columns(3)
+        with colx:
+            x_center = st.number_input("X-center [mm]", format="%.3f", value=float(np.mean(verts_orig[:, 0])))
+        with coly:
+            y_center = st.number_input("Y-center [mm]", format="%.3f", value=float(np.mean(verts_orig[:, 1])))
+        with colz:
+            z_center = st.number_input("Z-center [mm]", format="%.3f", value=float(np.mean(verts_orig[:, 2])))
+
+        # Step 4: Get hex parameters
+        st.subheader("Step 4: Hex Hole Parameters")
+        colht, colhb, cold = st.columns(3)
+        with colht:
+            top_f2f = st.number_input(
+                "Hex TOP flat-to-flat [mm]", min_value=0.5, value=5.0, step=0.1
+            )
+        with colhb:
+            bot_f2f = st.number_input(
+                "Hex BOTTOM flat-to-flat [mm]", min_value=0.1, value=4.8, step=0.1
+            )
+        with cold:
+            depth = st.number_input(
+                "Hex DEPTH [mm]", min_value=0.1, max_value=float(np.ptp(verts_orig[:, 2])), value=float(np.ptp(verts_orig[:, 2])), step=0.1
+            )
+
+        # Step 5: Cut Hex Hole when button clicked
+        if st.button("Cut Hex Hole"):
+            # 1) Remove + insert hex:
+            verts_mod, faces_mod = slice_and_insert_hex(
+                verts_orig,
+                faces_orig,
+                x_center,
+                top_f2f,
+                bot_f2f,
+                depth,
+                z_center
+            )
+
+            # 2) Generate ASCII STL of modified mesh
+            stl_text_mod = write_stl_ascii(verts_mod, faces_mod, solid_name="modified_with_hex")
+            stl_bytes_mod = stl_text_mod.encode("utf-8")
+
+            # 3) Preview modified STL
+            st.subheader("Modified STL Preview")
+            b64_mod = base64.b64encode(stl_bytes_mod).decode()
+            html_mod = f"""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+              <meta charset="UTF-8" />
+              <title>Modified STL Preview</title>
+              <style>
+                body {{ margin: 0; }}
+                #viewer {{ width: 100%; height: 300px; }}
+              </style>
+            </head>
+            <body>
+              <div id="viewer"></div>
+              <script src="https://cdn.jsdelivr.net/npm/three@0.150/build/three.min.js"></script>
+              <script src="https://cdn.jsdelivr.net/npm/three@0.150/examples/js/loaders/STLLoader.js"></script>
+              <script>
+                const scene = new THREE.Scene();
+                const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
+                const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+                renderer.setSize(window.innerWidth, 300);
+                document.getElementById('viewer').appendChild(renderer.domElement);
+
+                const ambient = new THREE.AmbientLight(0x404040);
+                scene.add(ambient);
+                const directional = new THREE.DirectionalLight(0xffffff, 1);
+                directional.position.set(1, 1, 1).normalize();
+                scene.add(directional);
+
+                const loader = new THREE.STLLoader();
+                loader.load('data:application/sla;base64,{b64_mod}', function (geometry) {{
+                  const material = new THREE.MeshNormalMaterial();
+                  const mesh = new THREE.Mesh(geometry, material);
+                  scene.add(mesh);
+
+                  const box = new THREE.Box3().setFromObject(mesh);
+                  const size = box.getSize(new THREE.Vector3()).length();
+                  const center = box.getCenter(new THREE.Vector3());
+
+                  mesh.position.x += (mesh.position.x - center.x);
+                  mesh.position.y += (mesh.position.y - center.y);
+                  mesh.position.z += (mesh.position.z - center.z);
+
+                  camera.position.set(center.x, center.y, size * 2);
+                  camera.lookAt(center);
+
+                  function animate() {{
+                    requestAnimationFrame(animate);
+                    mesh.rotation.x += 0.005;
+                    mesh.rotation.y += 0.005;
+                    renderer.render(scene, camera);
+                  }}
+                  animate();
+                }});
+              </script>
+            </body>
+            </html>
+            """
+            st.components.v1.html(html_mod, height=320)
+
+            # 4) Download button for modified STL
+            st.download_button(
+                label="Download Modified `.stl`",
+                data=stl_bytes_mod,
+                file_name="modified_with_hex.stl",
+                mime="application/vnd.ms-pki.stl"
+            )
+            st.success("Modified STL is ready to download!")
+    else:
+        st.info("Upload a `.stl` file in order to cut a hex hole.")
