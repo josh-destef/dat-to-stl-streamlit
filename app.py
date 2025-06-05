@@ -310,46 +310,49 @@ def build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness):
 
 def slice_and_insert_hex(verts, faces, x_slice, f2f_top, f2f_bot, depth):
     """
-    1) Identify all vertex‐indices whose |x - x_slice| < tol. Collect those in slice_verts.  
-    2) Remove any face (triangle) that references any of slice_verts → keep_faces.  
-    3) Build a perfect “unit” hex prism at x=0 in Y–Z via build_unit_hex_prism(…).  
-    4) Translate that hex prism to x = x_slice (add x_slice to all hex‐verts' x‐coordinate).  
-    5) Append the 12 new hex‐verts to the original vertex list.  
-    6) Reindex all hex‐faces by adding n_old (original vertex count) to each.  
-    7) Stack keep_faces + hex_faces → faces_new.  
-    Returns (verts_new, faces_new).
+    1) Identify any face whose triangle crosses x=x_slice (or lies entirely on that plane within tol). Remove it.
+    2) Build a 12‐vertex unit hex prism at x=0 (in Y–Z) via build_unit_hex_prism.
+    3) Translate that unit hex to x = x_slice.
+    4) Append hex vertices and reindex hex faces.
+    5) Return the combined (verts_new, faces_new).
     """
     thickness = np.max(verts[:, 2])  # should equal the extrusion thickness
+    tol = 1e-3  # tolerance in mm to catch faces “on” the slice
 
-    # 1) Find any vertex within tol of x_slice
-    tol = 1e-6
-    x_coords = verts[:, 0]
-    slice_mask = np.abs(x_coords - x_slice) < tol
-    slice_verts = np.nonzero(slice_mask)[0]
-
-    # 2) Remove all faces that reference slice_verts
     keep_faces = []
     for tri in faces:
-        if any(v in slice_verts for v in tri):
+        xs = verts[tri, 0]
+        x_min = xs.min()
+        x_max = xs.max()
+
+        # Remove if this triangle crosses x_slice (strictly between)
+        if (x_min < x_slice - tol and x_max > x_slice + tol):
             continue
+
+        # Remove if all three vertices lie within tol of x_slice (to avoid tiny slivers)
+        if all(abs(xi - x_slice) < tol for xi in xs):
+            continue
+
+        # Otherwise, keep the face
         keep_faces.append(tri)
+
     keep_faces = np.array(keep_faces, dtype=int)
 
-    # 3) Build a “unit” hex prism at x=0
+    # Build a “unit” hex prism at x=0 in Y–Z
     verts_hex_unit, faces_hex_unit = build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness)
 
-    # 4) Translate hex prism to x = x_slice
+    # Translate the hex prism so its center‐plane is x = x_slice
     verts_hex = verts_hex_unit.copy()
     verts_hex[:, 0] += x_slice
 
-    # 5) Append hex vertices to original verts
+    # Append the new hex vertices onto the original vertices
     n_old = verts.shape[0]
-    verts_new = np.vstack([verts, verts_hex])  # now size = n_old + 12
+    verts_new = np.vstack([verts, verts_hex])  # shape → (n_old + 12) × 3
 
-    # 6) Reindex hex faces by offsetting with n_old
+    # Reindex the hex faces by offsetting each index by n_old
     faces_hex = faces_hex_unit + n_old
 
-    # 7) Combine
+    # Combine the kept foil faces with the new hex faces
     faces_new = np.vstack([keep_faces, faces_hex])
 
     return verts_new, faces_new
