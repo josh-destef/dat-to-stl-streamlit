@@ -11,7 +11,6 @@ st.title("Airfoil Toolkit")
 
 tab1, tab2 = st.tabs(["View Airfoil", "Extrude to STL"])
 
-
 # -------------------------
 # 1) Shared helper functions
 # -------------------------
@@ -73,6 +72,7 @@ def resample_profile_xy(xy, num_pts=200):
 def point_in_triangle(pt, a, b, c):
     """
     Return True if point pt lies inside triangle (a,b,c) in 2D.
+    (Barycentric method.)
     """
     v0 = c - a
     v1 = b - a
@@ -103,7 +103,8 @@ def is_convex(prev_pt, curr_pt, next_pt):
 
 def triangulate_polygon(contour_xy):
     """
-    Ear‐clipping triangulation for a CCW 2D contour. Returns a list of index‐triples (i, j, k).
+    Ear‐clipping triangulation for a single CCW 2D contour (N×2).
+    Returns a list of index‐triples (i, j, k).
     """
     n = len(contour_xy)
     if n < 3:
@@ -144,41 +145,6 @@ def triangulate_polygon(contour_xy):
     return triangles
 
 
-def extrude_to_vertices_faces(xy_points, thickness_mm, num_interp=200):
-    """
-    1) Resample xy_points to num_interp via spline (smooth contour).  
-    2) Build a 3D “plate” with bottom at z=0 and top at z=thickness_mm.  
-    3) Triangulate the 2D contour for bottom & top caps.  
-    4) Add side‐wall faces.  
-    Returns (vertices (2n×3), faces (F×3)).
-    """
-    contour = resample_profile_xy(xy_points, num_interp)
-    n = contour.shape[0]
-    vertices = np.zeros((2 * n, 3), dtype=float)
-    for i in range(n):
-        x_val, y_val = contour[i]
-        vertices[i] = [x_val, y_val, 0.0]
-        vertices[n + i] = [x_val, y_val, thickness_mm]
-
-    faces = []
-    bottom_tris = triangulate_polygon(contour)
-    for (i, j, k) in bottom_tris:
-        faces.append([i, k, j])            # bottom cap
-    for (i, j, k) in bottom_tris:
-        faces.append([n + i, n + j, n + k])  # top cap
-
-    for i in range(n):
-        i_next = (i + 1) % n
-        b0 = i
-        b1 = i_next
-        t0 = n + i
-        t1 = n + i_next
-        faces.append([b0, b1, t1])
-        faces.append([b0, t1, t0])
-
-    return vertices, np.array(faces, dtype=int)
-
-
 def write_stl_ascii(vertices, faces, solid_name="airfoil_extrusion"):
     """
     Write an ASCII STL string from (vertices, faces). Return as one string.
@@ -208,166 +174,75 @@ def write_stl_ascii(vertices, faces, solid_name="airfoil_extrusion"):
     return output.getvalue()
 
 
-# -------------------------
-# 2) Find chordwise station of maximum thickness
-# -------------------------
-
-def find_max_thickness_x(contour, num_samples=500):
+def triangulate_with_hole(outer_xy, inner_xy):
     """
-    Given a 2D contour (N×2), sample num_samples x-values from min(x) to max(x).
-    For each xg, find intersections with x=xg, compute vertical thickness = max(Y)-min(Y).
-    Return the xg that maximizes thickness.
+    Build a simple “single‐ring” polygon by connecting the outer contour to the hole contour 
+    with a single bridge, then ear‐clip that. Returns a list of index triples into the combined array,
+    plus the combined XY array itself.
+    - outer_xy: (n×2), CCW
+    - inner_xy: (m×2), CCW (we will reverse it to CW)
+    Combined polygon is:
+      outer[oi], outer[oi+1], …, outer wrap…, outer[oi-1],  outer[oi],
+      followed by inner[hi], inner[hi-1], …, inner wrap …, inner[hi-1].
+    where 
+      hi = argmin(inner_xy[:,0])  (hole’s leftmost vertex),
+      oi = argmin(outer_xy[:,0])  (outer’s leftmost vertex).
     """
-    xs = contour[:, 0]
-    minx, maxx = xs.min(), xs.max()
-    x_grid = np.linspace(minx, maxx, num_samples)
-    best_x = minx
-    best_thk = 0.0
+    n = len(outer_xy)
+    m = len(inner_xy)
 
-    for xg in x_grid:
-        y_ints = []
-        for i in range(len(contour)):
-            x1, y1 = contour[i]
-            x2, y2 = contour[(i + 1) % len(contour)]
-            if (x1 - xg) * (x2 - xg) <= 0 and abs(x2 - x1) > 1e-8:
-                t = (xg - x1) / (x2 - x1)
-                yi = y1 + t * (y2 - y1)
-                y_ints.append(yi)
-        if len(y_ints) >= 2:
-            y_top = max(y_ints)
-            y_bot = min(y_ints)
-            thk = y_top - y_bot
-            if thk > best_thk:
-                best_thk = thk
-                best_x = xg
+    # Pick the hole‐vertex hi with minimal x:
+    hi = int(np.argmin(inner_xy[:, 0]))
+    # Pick outer vertex oi with minimal x:
+    oi = int(np.argmin(outer_xy[:, 0]))
 
-    return best_x
+    # Build an “outer ring” starting at oi, wrapping around
+    outer_seq = []
+    for i in range(n):
+        idx = (oi + i) % n
+        outer_seq.append(tuple(outer_xy[idx]))
+
+    # Build a “hole ring” in **reverse** (CW) starting at hi:
+    inner_seq = []
+    for i in range(m):
+        idx = (hi - i) % m
+        inner_seq.append(tuple(inner_xy[idx]))
+
+    # Combined = outer_seq + inner_seq
+    combined = outer_seq + inner_seq
+    combined_arr = np.array(combined, dtype=float)
+
+    # Now ear‐clip that combined_arr
+    tri_indices = triangulate_polygon(combined_arr)
+
+    # tri_indices refers to indices in [0 .. (n + m - 1)]
+    # Return both the triangle list and the combined array
+    return tri_indices, combined_arr
+
+
+def build_hex_2d(f2f, x0, y0):
+    """
+    Build a regular hexagon (flat‐to‐flat = f2f) in 2D, centered at (x0, y0), 
+    returning an (6 × 2) array in CCW order.
+    Formula: radius R = (f2f/2)/cos(π/6), vertices at 30° + k*60°.
+    """
+    R = (f2f / 2.0) / np.cos(np.pi / 6)
+    pts = []
+    for k in range(6):
+        theta = np.pi / 6 + k * (np.pi / 3)  # 30°, 90°, 150°, …
+        x = x0 + R * np.cos(theta)
+        y = y0 + R * np.sin(theta)
+        pts.append([x, y])
+    return np.array(pts, dtype=float)  # shape (6, 2)
 
 
 # -------------------------
-# 3) Build a “unit” hex prism (in Y–Z) with axis along Z, top at z=depth, bottom at z=0
-# -------------------------
-
-def build_unit_hex_prism(f2f_top, f2f_bot, depth):
-    """
-    Build a 12-vertex “unit” hex prism whose axis is along +Z at x=0, y=0:
-      - Top cap sits at z = depth  (flat-to-flat = f2f_top).
-      - Bottom cap sits at z = 0    (flat-to-flat = f2f_bot).
-    All x-coordinates = 0, all y‐coordinates centered at 0.
-    Returns:
-      • verts_hex (12×3)
-      • faces_hex (12×3) of triangle indices:
-         – 6 quads for sides → 12 triangles
-         – 4 triangles for top hex cap
-         – 4 triangles for bottom hex cap
-    """
-    def hex_corners(f2f, center_y, center_z):
-        R = (f2f / 2.0) / np.cos(np.pi / 6)  # circumradius
-        pts = []
-        for k in range(6):
-            theta = np.pi / 6 + k * (np.pi / 3)  # 30°, 90°, 150°, ...
-            y = center_y + R * np.cos(theta)
-            z = center_z + R * np.sin(theta)
-            pts.append([0.0, y, z])
-        return np.array(pts, dtype=float)
-
-    # Build 6 corners at top (z=depth), 6 at bottom (z=0)
-    top_pts = hex_corners(f2f_top, 0.0, depth)  # indices 0..5
-    bot_pts = hex_corners(f2f_bot, 0.0, 0.0)     # indices 6..11
-
-    verts_hex = np.vstack([top_pts, bot_pts])  # (12×3)
-
-    faces = []
-    # Side walls: for i=0..5, quad between top[i], top[i+1], bot[i+1], bot[i]
-    for i in range(6):
-        i_next = (i + 1) % 6
-        top_i = i
-        top_inext = i_next
-        bot_i = 6 + i
-        bot_inext = 6 + i_next
-        # Split that quad into two triangles:
-        faces.append([top_i, top_inext, bot_inext])
-        faces.append([top_i, bot_inext, bot_i])
-
-    # Top cap: fan around vertex 0  → (0,1,2), (0,2,3), (0,3,4), (0,4,5)
-    for i in range(1, 5):
-        faces.append([0, i, i + 1])
-
-    # Bottom cap: fan around vertex 6 → (6,7,8), (6,8,9), (6,9,10), (6,10,11)
-    for corner in range(7, 11):
-        faces.append([6, corner, corner + 1])
-
-    return verts_hex, np.array(faces, dtype=int)
-
-
-# -------------------------
-# 4) Slice–and–Insert Hex into the existing mesh
-# -------------------------
-
-def slice_and_insert_hex(verts, faces, x_center, y_center, f2f_top, f2f_bot, depth, thickness):
-    """
-    1) Identify any vertex whose |x - x_center| < tol, |y - y_center| < tol,
-       and whose z is within [thickness - depth, thickness]. Those all get removed.
-    2) Remove every triangle (face) that references any such vertex → keep_faces.
-    3) Build a “unit” hex prism (in Y–Z) from z=0..depth via build_unit_hex_prism(f2f_top,f2f_bot,depth).
-    4) Translate that prism’s vertices to:
-         x = x_center,
-         y = y_center,
-         z = (thickness - depth) + (unit_z).
-       (So its bottom cap sits at z = thickness - depth, top cap at z = thickness.)
-    5) Append those 12 new vertices to the original vertex list, re-index hex faces by +n_old.
-    6) Return combined (verts_new, faces_new).
-    """
-    tol = 1e-6
-
-    # a) Which vertices lie in the small vertical column around (x_center,y_center) from z=thickness-depth..thickness?
-    z_coords = verts[:, 2]
-    mask_slice = (
-        (np.abs(verts[:, 0] - x_center) < tol) &
-        (np.abs(verts[:, 1] - y_center) < tol) &
-        (z_coords >= (thickness - depth) - tol) &
-        (z_coords <= (thickness + tol))
-    )
-    slice_verts = np.nonzero(mask_slice)[0]
-
-    # b) Remove all faces that reference any slice_vert
-    keep_faces = []
-    for tri in faces:
-        if any(v in slice_verts for v in tri):
-            continue
-        keep_faces.append(tri)
-    keep_faces = np.array(keep_faces, dtype=int)
-
-    # c) Build “unit” hex prism (z from 0..depth, x=0, y=0)
-    verts_hex_unit, faces_hex_unit = build_unit_hex_prism(f2f_top, f2f_bot, depth)
-
-    # d) Translate hex prism so its bottom cap is at z = thickness - depth,
-    #    i.e. add (thickness - depth) to each unit_z, and shift x->x_center, y->y_center
-    verts_hex = verts_hex_unit.copy()
-    verts_hex[:, 0] += x_center
-    verts_hex[:, 1] += y_center
-    verts_hex[:, 2] += (thickness - depth)
-
-    # e) Append hex vertices
-    n_old = verts.shape[0]
-    verts_new = np.vstack([verts, verts_hex])  # now size = n_old + 12
-
-    # f) Re‐index hex faces by + n_old
-    faces_hex = faces_hex_unit + n_old
-
-    # g) Combine the kept original faces + new hex faces
-    faces_new = np.vstack([keep_faces, faces_hex])
-
-    return verts_new, faces_new
-
-
-# -------------------------
-# 5) TAB 1: View Airfoil
+# 2) TAB 1: View Airfoil
 # -------------------------
 with tab1:
     st.header("View Airfoil Profile")
     dat_file_v = st.file_uploader(
-        "Upload `.dat` to view (first line is description)", 
+        "Upload `.dat` to view (first line is description)",
         type=["dat"], key="view"
     )
     if dat_file_v:
@@ -386,10 +261,10 @@ with tab1:
 
 
 # -------------------------
-# Tab 2: Extrude to STL + Drill Hex Hole (Through‐Hole Version)
+# 3) TAB 2: Extrude to STL (with “Hole Built In”)
 # -------------------------
 with tab2:
-    st.header("Extrude Airfoil to STL + Drill Hex Hole (Through Hole)")
+    st.header("Extrude Airfoil to STL + Drill a Finite‐Depth Hex Hole")
 
     # 1) Upload a DAT
     dat_file_e = st.file_uploader(
@@ -405,7 +280,7 @@ with tab2:
         if coords_e.shape[0] < 3:
             st.error("Failed to parse enough points. Please upload a valid airfoil DAT.")
         else:
-            # 2) Extrusion parameters
+            # 2) Main parameters
             st.subheader("Parameters")
             col1, col2 = st.columns(2)
             with col1:
@@ -421,7 +296,7 @@ with tab2:
                     format="%.3f"
                 )
 
-            # 3) Show bounding‐box in X/Y/Z (scaled)
+            # 3) Show bounding‐box in X, Y, Z
             st.subheader("Airfoil Bounding-Box (X, Y, Z)")
             scaled_coords_xy = coords_e * scale_factor
             xs_scaled = scaled_coords_xy[:, 0]
@@ -433,51 +308,52 @@ with tab2:
             st.write(f"• Y span: {y_max - y_min:.3f} mm   (from {y_min:.3f} to {y_max:.3f})")
             st.write(f"• Z span: {z_max - z_min:.3f} mm")
 
-            # 4) Optional: Resampled 2D preview
-            st.subheader("Optional: Resampled Preview (2D)")
+            # 4) Optional: 2D resampled preview
+            st.subheader("Optional: Resampled 2D Preview")
             num_pts = st.slider(
                 "Resample points for smoothness",
-                min_value=50, max_value=500, value=300, step=10
+                min_value=50, max_value=500,
+                value=300, step=10
             )
-            contour_preview = resample_profile_xy(scaled_coords_xy, num_pts)
-            fig_e = plot_2d_profile(contour_preview, title="Resampled & Scaled (2D)")
-            st.pyplot(fig_e)
+            # Resample and scale
+            contour_xy = resample_profile_xy(scaled_coords_xy, num_pts)  # shape (n,2)
 
-            # 5) Let user choose X, Y on that 2D plot, show a red marker
+            fig2d = plot_2d_profile(contour_xy, title="Resampled & Scaled (2D)")
+            st.pyplot(fig2d)
+
+            # 5) Let user choose Hex center (x_choice, y_choice)
             st.subheader("Choose `x` and `y` for the Hex Center (in mm)")
             x_choice = st.slider(
                 "Hole center X [mm]",
-                min_value=x_min,
-                max_value=x_max,
+                min_value=x_min, max_value=x_max,
                 value=(x_min + x_max) / 2.0,
                 step=(x_max - x_min) / 1000.0
             )
             y_choice = st.slider(
                 "Hole center Y [mm]",
-                min_value=y_min,
-                max_value=y_max,
-                value=(y_min + y_max) / 2.0,  # default to midpoint
+                min_value=y_min, max_value=y_max,
+                value=(y_min + y_max) / 2.0,
                 step=(y_max - y_min) / 1000.0
             )
 
-            # Plot the 2D contour with a red dot at (x_choice, y_choice)
-            fig2, ax2 = plt.subplots(figsize=(5, 2.5))
-            ax2.plot(contour_preview[:, 0], contour_preview[:, 1], "-k", linewidth=2)
-            ax2.scatter([x_choice], [y_choice], c="red", s=60, label="Hex Center")
-            ax2.set_aspect("equal", "box")
-            ax2.set_xlabel("x [mm]")
-            ax2.set_ylabel("y [mm]")
-            ax2.set_title("2D Airfoil (with chosen Hex Center)")
-            ax2.grid(True, linestyle="--", alpha=0.4)
-            ax2.legend()
-            st.pyplot(fig2)
+            # Show the 2D contour plus a red dot at (x_choice, y_choice)
+            fig_marker, ax_marker = plt.subplots(figsize=(5, 2.5))
+            ax_marker.plot(contour_xy[:, 0], contour_xy[:, 1], "-k", linewidth=2)
+            ax_marker.scatter([x_choice], [y_choice], c="red", s=60, label="Hex Center")
+            ax_marker.set_aspect("equal", "box")
+            ax_marker.set_xlabel("x [mm]")
+            ax_marker.set_ylabel("y [mm]")
+            ax_marker.set_title("2D Airfoil (Chosen Hex Center)")
+            ax_marker.grid(True, linestyle="--", alpha=0.4)
+            ax_marker.legend()
+            st.pyplot(fig_marker)
 
-            # 6) Tapered‐hex parameters (through thickness)
-            st.subheader("Tapered‐Hex Hole Parameters (Through Hole)")
-            col_ht, col_hb = st.columns(2)
+            # 6) Tapered‐Hex parameters & hole depth
+            st.subheader("Tapered‐Hex Hole Parameters")
+            col_ht, col_hb, col_depth = st.columns(3)
             with col_ht:
                 top_f2f = st.number_input(
-                    "Hex TOP flat‐to‐flat [mm] (at z = thickness)",
+                    "Hex TOP flat‐to‐flat [mm] (at z = hole‐top)",
                     min_value=0.5, value=5.0, step=0.1
                 )
             with col_hb:
@@ -485,64 +361,179 @@ with tab2:
                     "Hex BOTTOM flat‐to‐flat [mm] (at z = 0)",
                     min_value=0.1, value=4.8, step=0.1
                 )
+            with col_depth:
+                depth = st.number_input(
+                    "Hole DEPTH (mm)",
+                    min_value=0.0, max_value=thickness,
+                    value=min( (y_max - y_min) * 0.3, thickness ),  # default 30% of chord
+                    step=0.1
+                )
 
-            # 7) Generate & Preview final STL
+            # 7) Generate & preview final mesh
             st.subheader("Generate & Preview STL")
             stl_name = st.text_input("Filename (no extension)", value="airfoil_extrusion")
             if not stl_name.strip():
                 st.error("Please enter a valid filename.")
             else:
-                if st.button("Create STL with Through‐Hole Hex"):
-                    # a) Build the extruded foil mesh from z=0..thickness
-                    verts_foil, faces_foil = extrude_to_vertices_faces(
-                        scaled_coords_xy, thickness, num_interp=num_pts
-                    )
+                if st.button("Create STL with Finite‐Depth Hex Hole"):
+                    # —————————————————————————————
+                    # A) Build the 2D polygons for triangulation
+                    # —————————————————————————————
+                    n = contour_xy.shape[0]
+                    m = 6  # hex has 6 vertices
 
-                    # b) Drill a through‐hole: remove any triangle whose vertices lie
-                    #    in a small vertical column around (x_choice, y_choice),
-                    #    for all z ∈ [0, thickness].
-                    tol = 1e-6
-                    mask_slice = (
-                        (np.abs(verts_foil[:, 0] - x_choice) < tol) &
-                        (np.abs(verts_foil[:, 1] - y_choice) < tol) &
-                        (verts_foil[:, 2] >= 0.0 - tol) &
-                        (verts_foil[:, 2] <= thickness + tol)
-                    )
-                    slice_verts = np.nonzero(mask_slice)[0]
+                    # 1) Outer ring (airfoil), CCW, at z = 0 and z = depth and z = thickness
+                    outer_xy = contour_xy.copy()  # shape (n,2)
 
-                    keep_faces = []
-                    for tri in faces_foil:
-                        if any(v in slice_verts for v in tri):
-                            continue
-                        keep_faces.append(tri)
-                    keep_faces = np.array(keep_faces, dtype=int)
+                    # 2) Build two hex contours (bot and top of hole):
+                    #    - Hex at z=0 uses bot_f2f
+                    hex_bot_xy = build_hex_2d(bot_f2f, x_choice, y_choice)  # (6,2)
+                    #    - Hex at z=depth uses top_f2f
+                    hex_top_xy = build_hex_2d(top_f2f, x_choice, y_choice)  # (6,2)
 
-                    # c) Build a “unit” hex prism from z=0..thickness (x=0,y=0)
-                    verts_hex_unit, faces_hex_unit = build_unit_hex_prism(
-                        top_f2f, bot_f2f, thickness
-                    )
+                    # ——————————
+                    # B) Triangulate the 2D “polygon with hole” at z = 0
+                    # ——————————
+                    # We need bottom cap of the hole: outer ring minus hex_bot ring.
+                    tri_bot_indices, combined_bot = triangulate_with_hole(outer_xy, hex_bot_xy)
+                    # combined_bot has length n + m; tri_bot_indices refers to combined indices in [0..n+m-1]
 
-                    # d) Translate hex vertices to (x_choice, y_choice, z)
-                    verts_hex = verts_hex_unit.copy()
-                    verts_hex[:, 0] += x_choice
-                    verts_hex[:, 1] += y_choice
-                    # Note: hex unit already goes from z=0..thickness
+                    # ——————————
+                    # C) Triangulate the 2D “polygon with hole” at z = depth
+                    # ——————————
+                    tri_depth_indices, combined_depth = triangulate_with_hole(outer_xy, hex_top_xy)
+                    # combined_depth length also n + m
 
-                    # e) Append the 12 hex vertices to the foil vertex list
-                    n_old = verts_foil.shape[0]
-                    verts_new = np.vstack([verts_foil, verts_hex])  # shape = (n_old+12, 3)
+                    # ——————————
+                    # D) Triangulate the 2D outer airfoil at z = thickness (no hole)
+                    # ——————————
+                    tri_top_only = triangulate_polygon(outer_xy)  # each triple in [0..n-1]
 
-                    # f) Reindex hex faces by +n_old
-                    faces_hex = faces_hex_unit + n_old
+                    # —————————————————————————————
+                    # E) Build the 3D vertex array
+                    # —————————————————————————————
+                    # We'll allocate in this order:
+                    #   1) outer_z0:   indices [0 .. n-1],  z=0
+                    #   2) hex_z0:     indices [ n .. n+m-1],  z=0
+                    #   3) outer_zD:   indices [ n+m .. n+m+n-1],  z=depth
+                    #   4) hex_zD:     indices [ n+m+n .. n+m+n+m-1],  z=depth
+                    #   5) outer_zT:   indices [ n+m+n+m .. n+m+n+m+n-1],  z=thickness
+                    #
+                    #           total vertices = 3n + 2m
+                    #
+                    total_vertices = 3 * n + 2 * m
+                    verts_3d = np.zeros((total_vertices, 3), dtype=float)
 
-                    # g) Combine kept foil faces + new hex faces
-                    faces_new = np.vstack([keep_faces, faces_hex])
+                    # 1) Outer at z=0
+                    for i in range(n):
+                        x_i, y_i = outer_xy[i]
+                        verts_3d[i] = [x_i, y_i, 0.0]
 
-                    # h) Generate ASCII STL text
-                    stl_text = write_stl_ascii(verts_new, faces_new, solid_name=stl_name)
+                    # 2) Hex bottom at z=0
+                    for j in range(m):
+                        xh, yh = hex_bot_xy[j]
+                        verts_3d[n + j] = [xh, yh, 0.0]
+
+                    # 3) Outer at z=depth
+                    offset_outer_zD = n + m
+                    for i in range(n):
+                        x_i, y_i = outer_xy[i]
+                        verts_3d[offset_outer_zD + i] = [x_i, y_i, depth]
+
+                    # 4) Hex top at z=depth
+                    offset_hex_zD = n + m + n
+                    for j in range(m):
+                        xh, yh = hex_top_xy[j]
+                        verts_3d[offset_hex_zD + j] = [xh, yh, depth]
+
+                    # 5) Outer at z=thickness (no hole)
+                    offset_outer_zT = n + m + n + m
+                    for i in range(n):
+                        x_i, y_i = outer_xy[i]
+                        verts_3d[offset_outer_zT + i] = [x_i, y_i, thickness]
+
+                    # —————————————————————————————
+                    # F) Build the triangular faces
+                    # —————————————————————————————
+                    faces_3d = []
+
+                    # F.1) Bottom‐cap (z=0) with hole: use tri_bot_indices on combined_bot.
+                    #     For each combined index k, if k < n, it maps to “outer_z0 _ index k” = k
+                    #                              else, it maps to “hex_z0 index (k - n)” = (n + (k-n)) = k
+                    for (a, b, c) in tri_bot_indices:
+                        ia = int(a)
+                        ib = int(b)
+                        ic = int(c)
+                        # map each to 3D index
+                        va = ia if ia < n else n + (ia - n)
+                        vb = ib if ib < n else n + (ib - n)
+                        vc = ic if ic < n else n + (ic - n)
+                        faces_3d.append([va, vb, vc])
+
+                    # F.2) Cap “at depth” (the top of the hole): use tri_depth_indices on combined_depth.
+                    #     Combined indices in [0..n-1] map to “outer_zD” = offset_outer_zD + i
+                    #     Combined indices in [n..n+m-1] map to “hex_zD” = offset_hex_zD + (i-n)
+                    for (a, b, c) in tri_depth_indices:
+                        ia = int(a)
+                        ib = int(b)
+                        ic = int(c)
+                        va = (offset_outer_zD + ia) if ia < n else (offset_hex_zD + (ia - n))
+                        vb = (offset_outer_zD + ib) if ib < n else (offset_hex_zD + (ib - n))
+                        vc = (offset_outer_zD + ic) if ic < n else (offset_hex_zD + (ic - n))
+                        faces_3d.append([va, vb, vc])
+
+                    # F.3) Top cap (z=thickness) without hole: tri_top_only on outer_xy.
+                    #     Each index i maps to offset_outer_zT + i
+                    for (i, j, k) in tri_top_only:
+                        faces_3d.append([
+                            offset_outer_zT + int(i),
+                            offset_outer_zT + int(j),
+                            offset_outer_zT + int(k)
+                        ])
+
+                    # F.4) Side‐walls of outer between z=0 → z=depth
+                    for i in range(n):
+                        i_next = (i + 1) % n
+                        # bottom‐outer: i, i_next
+                        # depth‐outer: offset_outer_zD + i, offset_outer_zD + i_next
+                        b0 = i
+                        b1 = i_next
+                        d0 = offset_outer_zD + i
+                        d1 = offset_outer_zD + i_next
+                        # two triangles:
+                        faces_3d.append([b0, b1, d1])
+                        faces_3d.append([b0, d1, d0])
+
+                    # F.5) Side‐walls of outer between z=depth → z=thickness
+                    for i in range(n):
+                        i_next = (i + 1) % n
+                        d0 = offset_outer_zD + i
+                        d1 = offset_outer_zD + i_next
+                        t0 = offset_outer_zT + i
+                        t1 = offset_outer_zT + i_next
+                        faces_3d.append([d0, d1, t1])
+                        faces_3d.append([d0, t1, t0])
+
+                    # F.6) Side‐walls of the hole between z=0 → z=depth
+                    for j in range(m):
+                        j_next = (j + 1) % m
+                        hb0 = n + j         # bottom‐hex index
+                        hb1 = n + j_next
+                        hd0 = offset_hex_zD + j
+                        hd1 = offset_hex_zD + j_next
+                        faces_3d.append([hb0, hb1, hd1])
+                        faces_3d.append([hb0, hd1, hd0])
+
+                    # Convert face list to NumPy
+                    faces_np = np.array(faces_3d, dtype=int)
+
+                    # —————————————————————————————
+                    # G) Write the STL and preview
+                    # —————————————————————————————
+                    stl_text = write_stl_ascii(verts_3d, faces_np, solid_name=stl_name)
                     stl_bytes = stl_text.encode("utf-8")
 
-                    # i) Three.js preview of final mesh
+                    # Three.js preview
                     b64 = base64.b64encode(stl_bytes).decode()
                     html = f"""
                     <!DOCTYPE html>
@@ -603,7 +594,7 @@ with tab2:
                     """
                     st.components.v1.html(html, height=420)
 
-                    # j) Download button
+                    # Download button
                     st.download_button(
                         label="Download `.stl`",
                         data=stl_bytes,
