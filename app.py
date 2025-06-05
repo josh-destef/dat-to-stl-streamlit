@@ -212,8 +212,8 @@ def build_tapered_hex_prism(cx, cy, top_f2f, bot_f2f, depth, top_z):
     - verts_hex is (12×3) array (6 top corners + 6 bottom corners).
     - faces_hex is (12×3) integer array of triangle indices:
        • 6 quads for the sides (split each into 2 triangles → 12 triangles)
-       • 6 triangles for top cap (fan)
-       • 6 triangles for bottom cap (fan, flipped)
+       • 4 triangles for top cap (fan)
+       • 4 triangles for bottom cap (fan, flipped)
     """
     # 1) Compute the circumradius R from flat‐to‐flat f2f:  R = (f2f/2)/cos(π/6)
     def hex_corners(f2f, x0, y0, z):
@@ -242,14 +242,14 @@ def build_tapered_hex_prism(cx, cy, top_f2f, bot_f2f, depth, top_z):
         faces.append([top_i, top_inext, bot_inext])
         faces.append([top_i, bot_inext, bot_i])
 
-    # 3) Triangulate the top hex face by “fan” around vertex 0 → 4 triangles (0,1,2), (0,2,3), (0,3,4), (0,4,5)
+    # 3) Triangulate the top hex face by “fan” around vertex 0 → (0,1,2), (0,2,3), (0,3,4), (0,4,5)
     for i in range(1, 5):
         faces.append([0, i, i + 1])
     # 4) Triangulate the bottom hex face (indices 6..11) similarly—but with flipped winding
     base = 6
     for i in range(1, 5):
         faces.append([base, base + i + 1, base + i])
-    # last triangle to close the fan: (6, 11, 7)
+    # Last triangle for bottom: (6, 11, 7)
     faces.append([base, base + 7, base + 11])
 
     return verts_hex, np.array(faces, dtype=int)
@@ -412,11 +412,10 @@ with tab2:
                     hex_mesh  = trimesh.Trimesh(vertices=verts_hex,  faces=faces_hex,  process=False)
 
                     try:
-                        # If you have OpenSCAD installed, you can specify engine="scad"
                         result_mesh = foil_mesh.difference(hex_mesh)
                     except BaseException as e:
                         st.error(f"Boolean‐difference failed: {e}")
-                        return
+                        st.stop()
 
                     verts_final = result_mesh.vertices
                     faces_final = result_mesh.faces
