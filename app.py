@@ -6,8 +6,9 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import base64
 
-# ----- New import for mesh‐boolean -----
+# ----- New import for mesh‐boolean and repairs -----
 import trimesh  
+from trimesh.repair import fill_holes, fix_normals  
 
 st.set_page_config(page_title="Airfoil Toolkit", layout="centered")
 st.title("Airfoil Toolkit")
@@ -215,7 +216,6 @@ def build_tapered_hex_prism(cx, cy, top_f2f, bot_f2f, depth, top_z):
        • 4 triangles for top cap (fan)
        • 4 triangles for bottom cap (fan, flipped)
     """
-    # 1) Compute the circumradius R from flat‐to‐flat f2f:  R = (f2f/2)/cos(π/6)
     def hex_corners(f2f, x0, y0, z):
         R = (f2f / 2.0) / np.cos(np.pi / 6)
         pts = []
@@ -231,25 +231,23 @@ def build_tapered_hex_prism(cx, cy, top_f2f, bot_f2f, depth, top_z):
     verts_hex = np.vstack([top_pts, bot_pts])  # (12×3)
 
     faces = []
-    # 2) Side‐walls: each i in [0..5] → quad between top[i], top[i+1], bot[i+1], bot[i]
+    # 2) Side‐walls
     for i in range(6):
         i_next = (i + 1) % 6
         top_i = i
         top_inext = i_next
         bot_i = 6 + i
         bot_inext = 6 + i_next
-        # split quad into two triangles
         faces.append([top_i, top_inext, bot_inext])
         faces.append([top_i, bot_inext, bot_i])
 
-    # 3) Triangulate the top hex face by “fan” around vertex 0 → (0,1,2), (0,2,3), (0,3,4), (0,4,5)
+    # 3) Top hex cap fan (0,1,2),(0,2,3),(0,3,4),(0,4,5)
     for i in range(1, 5):
         faces.append([0, i, i + 1])
-    # 4) Triangulate the bottom hex face (indices 6..11) similarly—but with flipped winding
+    # 4) Bottom hex cap fan (flip)
     base = 6
     for i in range(1, 5):
         faces.append([base, base + i + 1, base + i])
-    # Last triangle for bottom: (6, 11, 7)
     faces.append([base, base + 7, base + 11])
 
     return verts_hex, np.array(faces, dtype=int)
@@ -407,10 +405,26 @@ with tab2:
                         cx, cy, top_f2f, bot_f2f, depth, top_z=thickness
                     )
 
-                    # d) Convert both to trimesh.Trimesh and do boolean difference
-                    foil_mesh = trimesh.Trimesh(vertices=verts_foil, faces=faces_foil, process=False)
-                    hex_mesh  = trimesh.Trimesh(vertices=verts_hex,  faces=faces_hex,  process=False)
+                    # d) Convert both to trimesh.Trimesh with process=True
+                    foil_mesh = trimesh.Trimesh(vertices=verts_foil, faces=faces_foil, process=True)
+                    hex_mesh  = trimesh.Trimesh(vertices=verts_hex,  faces=faces_hex,  process=True)
 
+                    # e) Ensure foil_mesh is watertight
+                    if not foil_mesh.is_watertight:
+                        fill_holes(foil_mesh)
+                        fix_normals(foil_mesh)
+                    # f) Ensure hex_mesh is watertight
+                    if not hex_mesh.is_watertight:
+                        fill_holes(hex_mesh)
+                        fix_normals(hex_mesh)
+
+                    # If either still isn’t watertight, show an error
+                    if not foil_mesh.is_watertight or not hex_mesh.is_watertight:
+                        st.error("Could not make meshes watertight for boolean difference. "
+                                 "Try increasing mesh resolution or checking parameters.")
+                        st.stop()
+
+                    # g) Perform boolean difference
                     try:
                         result_mesh = foil_mesh.difference(hex_mesh)
                     except BaseException as e:
