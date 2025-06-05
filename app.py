@@ -38,6 +38,7 @@ def load_dat_coords(dat_bytes):
                 pass
     return np.array(pts, dtype=float)
 
+
 def plot_2d_profile(coords, title="Airfoil Profile"):
     """
     Given an (N×2) array of coordinates, plot x vs. y with equal axis.
@@ -51,6 +52,7 @@ def plot_2d_profile(coords, title="Airfoil Profile"):
     ax.set_title(title)
     ax.grid(True, linestyle="--", alpha=0.4)
     return fig
+
 
 def resample_profile_xy(xy, num_pts=200):
     """
@@ -66,6 +68,7 @@ def resample_profile_xy(xy, num_pts=200):
     if np.allclose(pts_interp[0], pts_interp[-1], atol=1e-6):
         pts_interp = pts_interp[:-1]
     return pts_interp
+
 
 def point_in_triangle(pt, a, b, c):
     v0 = c - a
@@ -84,11 +87,13 @@ def point_in_triangle(pt, a, b, c):
     v = (dot00 * dot12 - dot01 * dot02) * inv_denom
     return (u >= 0) and (v >= 0) and (u + v < 1)
 
+
 def is_convex(prev_pt, curr_pt, next_pt):
     v1 = prev_pt - curr_pt
     v2 = next_pt - curr_pt
     cross_z = v1[0] * v2[1] - v1[1] * v2[0]
     return cross_z < 0
+
 
 def triangulate_polygon(contour_xy):
     """
@@ -133,6 +138,7 @@ def triangulate_polygon(contour_xy):
         triangles.append((idxs[0], idxs[1], idxs[2]))
     return triangles
 
+
 def extrude_to_vertices_faces(xy_points, thickness_mm, num_interp=200):
     """
     Resample xy_points to num_interp, then build vertices/faces for extrusion.
@@ -143,14 +149,14 @@ def extrude_to_vertices_faces(xy_points, thickness_mm, num_interp=200):
     vertices = np.zeros((2 * n, 3), dtype=float)
     for i in range(n):
         x_val, y_val = contour[i]
-        vertices[i]     = [x_val, y_val, 0.0]
+        vertices[i] = [x_val, y_val, 0.0]
         vertices[n + i] = [x_val, y_val, thickness_mm]
     faces = []
     bottom_triangles = triangulate_polygon(contour)
     for (i, j, k) in bottom_triangles:
-        faces.append([i, k, j])
+        faces.append([i, k, j])  # bottom orientation
     for (i, j, k) in bottom_triangles:
-        faces.append([n + i, n + j, n + k])
+        faces.append([n + i, n + j, n + k])  # top cap
     for i in range(n):
         i_next = (i + 1) % n
         b0 = i
@@ -160,6 +166,7 @@ def extrude_to_vertices_faces(xy_points, thickness_mm, num_interp=200):
         faces.append([b0, b1, t1])
         faces.append([b0, t1, t0])
     return vertices, np.array(faces, dtype=int)
+
 
 def write_stl_ascii(vertices, faces, solid_name="airfoil_extrusion"):
     """
@@ -171,6 +178,7 @@ def write_stl_ascii(vertices, faces, solid_name="airfoil_extrusion"):
         if length == 0:
             return np.array([0.0, 0.0, 0.0], dtype=float)
         return n / length
+
     output = io.StringIO()
     output.write(f"solid {solid_name}\n")
     for tri in faces:
@@ -188,6 +196,7 @@ def write_stl_ascii(vertices, faces, solid_name="airfoil_extrusion"):
     output.write(f"endsolid {solid_name}\n")
     return output.getvalue()
 
+
 # -------------------------
 # Hex-hole carving helpers
 # -------------------------
@@ -202,30 +211,31 @@ def subtract_tapered_hex(verts, faces, cx, cy, top_f2f, bot_f2f, depth, foil_thi
     z_top = foil_thickness
     z_bot = z_top - depth
     kept = []
-    cos30 = np.cos(np.pi/6)
-    sin30 = np.sin(np.pi/6)
+    cos30 = np.cos(np.pi / 6)
+    sin30 = np.sin(np.pi / 6)
 
     for tri in faces:
         centroid = verts[tri].mean(axis=0)
         x_c, y_c, z_c = centroid
-        # 1) Check Z within hex region
+        # 1) Only carve in the z‐range [z_bot .. z_top]
         if not (z_bot <= z_c <= z_top):
             kept.append(tri)
             continue
+        # 2) Interpolate flat‐to‐flat at this z:
         lam = (z_top - z_c) / depth
         f2f_at_z = top_f2f - lam * (top_f2f - bot_f2f)
+        # 3) Rotate (x_c‐cx, y_c‐cy) by −30° so hex flats align with axes
         dx = x_c - cx
         dy = y_c - cy
-        # Rotate point by -30° to align hex flats with axes
         x_r = dx * cos30 + dy * sin30
         y_r = -dx * sin30 + dy * cos30
-        # If inside hex cross‐section, discard
+        # 4) If inside hex cross‐section, discard
         if max(abs(x_r), abs(y_r) / cos30) <= (f2f_at_z / 2.0):
             continue
         kept.append(tri)
 
     if not kept:
-        return np.zeros((0,3)), np.zeros((0,3), dtype=int)
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=int)
 
     kept = np.array(kept, dtype=int)
     unique_v = np.unique(kept.flatten())
@@ -234,33 +244,69 @@ def subtract_tapered_hex(verts, faces, cx, cy, top_f2f, bot_f2f, depth, foil_thi
     new_faces = np.vectorize(lambda i: idx_map[i])(kept)
     return new_verts, new_faces
 
+
+def find_max_thickness_x(contour, num_samples=500):
+    """
+    Given a 2D contour (N×2), sample `num_samples` x-values evenly
+    between min(contour[:,0]) and max(contour[:,0]). For each sample xg,
+    find all intersections of the contour segments with x = xg,
+    take top/bottom y, compute thickness = y_top - y_bot.
+    Returns the xg that yields maximum thickness.
+    """
+    xs = contour[:, 0]
+    minx, maxx = xs.min(), xs.max()
+    x_grid = np.linspace(minx, maxx, num_samples)
+    best_x = xs[0]
+    best_thk = 0.0
+
+    for xg in x_grid:
+        y_ints = []
+        # For each segment, check if it crosses x = xg
+        for i in range(len(contour)):
+            x1, y1 = contour[i]
+            x2, y2 = contour[(i + 1) % len(contour)]
+            if (x1 - xg) * (x2 - xg) <= 0 and abs(x2 - x1) > 1e-8:
+                t = (xg - x1) / (x2 - x1)
+                yi = y1 + t * (y2 - y1)
+                y_ints.append(yi)
+        if len(y_ints) >= 2:
+            y_top = max(y_ints)
+            y_bot = min(y_ints)
+            thk = y_top - y_bot
+            if thk > best_thk:
+                best_thk = thk
+                best_x = xg
+
+    return best_x
+
+
 def extrude_and_carve_hex(xy_points, thickness_mm, num_interp,
                           scale, top_f2f, bot_f2f, depth):
     """
     1) Resample and scale the 2D airfoil profile
     2) Extrude to a 3D plate
-    3) Find x-location of maximum vertical thickness (max(y_upper - y_lower))
-       and set hex center at (x_max_thick, 0)
+    3) Find x‐location of maximum vertical thickness
+       and set hex center at (x_max_thick * scale, 0)
     4) Carve a tapered hex hole through the thickness
-    Returns (verts_final, faces_final).
+    Returns (verts_final, faces_final, (contour_scaled, cx, cy)).
     """
     # 1) Resample and scale
     contour = resample_profile_xy(xy_points, num_interp)
-    contour *= scale  # scale X/Y
+    contour_scaled = contour * scale  # scale X/Y
 
     # 2) Extrude
-    n = contour.shape[0]
+    n = contour_scaled.shape[0]
     vertices = np.zeros((2 * n, 3), dtype=float)
     for i in range(n):
-        x_val, y_val = contour[i]
-        vertices[i]     = [x_val, y_val, 0.0]
+        x_val, y_val = contour_scaled[i]
+        vertices[i] = [x_val, y_val, 0.0]
         vertices[n + i] = [x_val, y_val, thickness_mm]
     faces = []
-    bottom_triangles = triangulate_polygon(contour)
+    bottom_triangles = triangulate_polygon(contour_scaled)
     for (i, j, k) in bottom_triangles:
-        faces.append([i, k, j])
+        faces.append([i, k, j])  # bottom orientation
     for (i, j, k) in bottom_triangles:
-        faces.append([n + i, n + j, n + k])
+        faces.append([n + i, n + j, n + k])  # top cap
     for i in range(n):
         i_next = (i + 1) % n
         b0 = i
@@ -271,27 +317,19 @@ def extrude_and_carve_hex(xy_points, thickness_mm, num_interp,
         faces.append([b0, t1, t0])
     faces = np.array(faces, dtype=int)
 
-    # 3) Compute chordwise thickness: at each unique x, find max(y) - min(y)
-    unique_x = np.unique(np.round(contour[:, 0], 8))
-    max_thick = 0.0
-    x_of_max = contour[0, 0]
-    for ux in unique_x:
-        ys_at_x = contour[np.isclose(contour[:, 0], ux, atol=1e-6), 1]
-        if len(ys_at_x) >= 2:
-            thickness_here = ys_at_x.max() - ys_at_x.min()
-            if thickness_here > max_thick:
-                max_thick = thickness_here
-                x_of_max = ux
-
-    cx = x_of_max
-    cy = 0.0  # centerline
+    # 3) Compute x of maximum vertical thickness (unscaled contour)
+    #    find it on the unscaled contour, then multiply by scale
+    x_unscaled_max = find_max_thickness_x(contour, num_samples=500)
+    cx = x_unscaled_max * scale
+    cy = 0.0  # assume centerline
 
     # 4) Carve hex hole
     verts_carved, faces_carved = subtract_tapered_hex(
         vertices, faces, cx, cy, top_f2f, bot_f2f, depth, thickness_mm
     )
 
-    return verts_carved, faces_carved, (contour, cx, cy)
+    return verts_carved, faces_carved, (contour_scaled, cx, cy)
+
 
 # -------------------------
 # Tab 1: View Airfoil
@@ -304,14 +342,18 @@ with tab1:
     )
     if dat_file_v:
         coords_v = load_dat_coords(dat_file_v.read())
-        st.subheader("2D Profile Plot")
-        fig_v = plot_2d_profile(coords_v, title="Uploaded Airfoil")
-        st.pyplot(fig_v)
-        if st.checkbox("Show coordinate table"):
-            df = pd.DataFrame(coords_v, columns=["x", "y"])
-            st.dataframe(df, height=200)
+        if coords_v.shape[0] < 3:
+            st.error("Need at least 3 points to display a valid airfoil.")
+        else:
+            st.subheader("2D Profile Plot")
+            fig_v = plot_2d_profile(coords_v, title="Uploaded Airfoil")
+            st.pyplot(fig_v)
+            if st.checkbox("Show coordinate table"):
+                df = pd.DataFrame(coords_v, columns=["x", "y"])
+                st.dataframe(df, height=200)
     else:
         st.info("Upload a `.dat` file to view the 2D profile.")
+
 
 # -------------------------
 # Tab 2: Extrude to STL
@@ -487,6 +529,5 @@ with tab2:
                             mime="application/vnd.ms-pki.stl"
                         )
                         st.success(f"STL `{stl_name}.stl` is ready!")
-
     else:
         st.info("Upload a `.dat` file to enable extrusion.")
