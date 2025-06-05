@@ -94,7 +94,7 @@ def point_in_triangle(pt, a, b, c):
 
 def is_convex(prev_pt, curr_pt, next_pt):
     """
-    Return True if prev_pt→curr_pt→next_pt is a convex “ear” in CCW ordering.
+    Return True if (prev_pt→curr_pt→next_pt) makes a convex “ear” in CCW ordering.
     """
     v1 = prev_pt - curr_pt
     v2 = next_pt - curr_pt
@@ -104,8 +104,8 @@ def is_convex(prev_pt, curr_pt, next_pt):
 
 def triangulate_polygon(contour_xy):
     """
-    Ear‐clipping triangulation for a CCW 2D contour (N×2).
-    Returns a list of index‐triples (i,j,k).
+    Ear‐clipping triangulation for a CCW 2D contour.
+    Returns a list of index‐triples (i, j, k).
     """
     n = len(contour_xy)
     if n < 3:
@@ -148,7 +148,7 @@ def triangulate_polygon(contour_xy):
 
 def extrude_to_vertices_faces(xy_points, thickness_mm, num_interp=200):
     """
-    1) Resample xy_points via spline to num_interp (smooth contour).  
+    1) Resample xy_points to num_interp via spline (smooth contour).  
     2) Build a 3D “plate” with bottom at z=0 and top at z=thickness_mm.  
     3) Triangulate the 2D contour for bottom & top caps.  
     4) Add side‐wall faces.  
@@ -165,9 +165,9 @@ def extrude_to_vertices_faces(xy_points, thickness_mm, num_interp=200):
     faces = []
     bottom_tris = triangulate_polygon(contour)
     for (i, j, k) in bottom_tris:
-        faces.append([i, k, j])            # bottom face
+        faces.append([i, k, j])            # bottom cap
     for (i, j, k) in bottom_tris:
-        faces.append([n + i, n + j, n + k])  # top face
+        faces.append([n + i, n + j, n + k])  # top cap
 
     for i in range(n):
         i_next = (i + 1) % n
@@ -211,14 +211,14 @@ def write_stl_ascii(vertices, faces, solid_name="airfoil_extrusion"):
 
 
 # -------------------------
-# 2) Utility: find x_of_max_thick
+# 2) Find chordwise station of max thickness
 # -------------------------
 
 def find_max_thickness_x(contour, num_samples=500):
     """
-    Given a 2D contour (N×2), sample num_samples x-values uniformly.
-    For each xg, compute the intersection Y’s of contour vs. line x=xg,
-    find vertical thickness = max(Y)-min(Y). Return the xg with max thickness.
+    Given a 2D contour (N×2), sample num_samples x-values from min(x) to max(x).
+    For each xg, find polygon intersections with x=xg, compute vertical thickness = max(Y)-min(Y),
+    return the xg that maximizes that thickness.
     """
     xs = contour[:, 0]
     minx, maxx = xs.min(), xs.max()
@@ -247,21 +247,22 @@ def find_max_thickness_x(contour, num_samples=500):
 
 
 # -------------------------
-# 3) Build hex prism in Y–Z plane at x = 0 (unit f2f = 1)
-#    → we'll translate & scale later
+# 3) Build a “unit” hex prism in Y–Z at x=0
 # -------------------------
 
 def build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness):
     """
-    Build a “unit” hex prism whose axis is the z-axis, centered at (y=0,z=thickness/2).
-    Top flat-to-flat at z=thickness is f2f_top; bottom flat-to-flat (z=thickness-depth) is f2f_bot.
-    All coordinates are (x=0, y, z). Return (verts_hex, faces_hex) in (x,y,z).
-    We’ll later scale y by (f2f_actual / f2f_top) or similar.
+    Build a 12‐vertex unit hex prism (axis along z, centered at y=0).  
+      - Top cap (z = thickness) has flat‐to‐flat = f2f_top.  
+      - Bottom cap (z = thickness - depth) has flat‐to‐flat = f2f_bot.  
+    Each vertex format: [x=0, y, z].  
+    Returns (verts_hex, faces_hex):
+      • verts_hex is shape (12×3).  
+      • faces_hex is shape (12, 3) of triangle indices:
+        – 6 quads for side walls → 12 triangles  
+        – 4 triangles for top cap  
+        – 4 triangles for bottom cap  
     """
-    # _Actually_, we want the hex in the Y–Z plane (since x is constant slice).
-    # But our hole axis is _along z_, so the hex cross-sections live in the y-axis for each z.
-    # We'll build 6 corners at top z & 6 corners at bottom z, all at x=0.
-
     def hex_corners(f2f, center_y, center_z):
         R = (f2f / 2.0) / np.cos(np.pi / 6)  # circumradius
         pts = []
@@ -272,60 +273,61 @@ def build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness):
             pts.append([0.0, y, z])
         return np.array(pts, dtype=float)
 
-    # Top center: (x=0, y=0, z=thickness)
     top_center_z = thickness
     bottom_center_z = thickness - depth
-    top_pts = hex_corners(f2f_top, 0.0, top_center_z)
-    bot_pts = hex_corners(f2f_bot, 0.0, bottom_center_z)
+
+    top_pts = hex_corners(f2f_top, 0.0, top_center_z)      # indices [0..5]
+    bot_pts = hex_corners(f2f_bot, 0.0, bottom_center_z)    # indices [6..11]
 
     verts_hex = np.vstack([top_pts, bot_pts])  # (12×3)
 
     faces = []
-    # 1) Side walls (6 quads → 12 triangles)
+    # 1) Side‐walls: each i=0..5 → quad between top[i], top[i+1], bot[i+1], bot[i]
     for i in range(6):
         i_next = (i + 1) % 6
         top_i = i
         top_inext = i_next
         bot_i = 6 + i
         bot_inext = 6 + i_next
+        # split that quad into two triangles:
         faces.append([top_i, top_inext, bot_inext])
         faces.append([top_i, bot_inext, bot_i])
 
-    # 2) Top hex cap: fan around vertex 0
+    # 2) Top hex cap: fan around vertex 0 (top) → (0,1,2), (0,2,3), (0,3,4), (0,4,5)
     for i in range(1, 5):
         faces.append([0, i, i + 1])
-    # 3) Bottom hex cap: fan around vertex 6 (flip winding)
-    base = 6
-    for i in range(1, 5):
-        faces.append([base, base + i + 1, base + i])
-    faces.append([base, base + 7, base + 11])
+
+    # 3) Bottom hex cap: fan around vertex 6 (bottom) → (6,7,8), (6,8,9), (6,9,10), (6,10,11)
+    for corner in range(7, 11):
+        faces.append([6, corner, corner + 1])
 
     return verts_hex, np.array(faces, dtype=int)
 
 
 # -------------------------
-# 4) “Slice‐and‐Rebuild” Carving
+# 4) Slice‐and‐Insert Hex
 # -------------------------
 
 def slice_and_insert_hex(verts, faces, x_slice, f2f_top, f2f_bot, depth):
     """
-    1) Identify all vertices whose |x - x_slice| < tol. Collect their indices as slice_verts.
-    2) Remove every face that uses any of slice_verts → leftover_faces.
-    3) Build a perfect hex prism at x=0 in Y–Z (unit) via build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness).
-    4) Translate those hex‐prism vertices to x = x_slice (i.e. add x_slice to their x‐coordinate).
-    5) Append hex‐verts to the existing vertex list, and append hex‐faces (with reindexed indices).
-    6) Return the new combined ( verts_new, faces_new ).
+    1) Identify all vertex‐indices whose |x - x_slice| < tol. Collect those in slice_verts.  
+    2) Remove any face (triangle) that references any of slice_verts → keep_faces.  
+    3) Build a perfect “unit” hex prism at x=0 in Y–Z via build_unit_hex_prism(…).  
+    4) Translate that hex prism to x = x_slice (add x_slice to all hex‐verts' x‐coordinate).  
+    5) Append the 12 new hex‐verts to the original vertex list.  
+    6) Reindex all hex‐faces by adding n_old (original vertex count) to each.  
+    7) Stack keep_faces + hex_faces → faces_new.  
+    Returns (verts_new, faces_new).
     """
+    thickness = np.max(verts[:, 2])  # should equal the extrusion thickness
 
-    thickness = np.max(verts[:, 2])  # should equal thickness input
-
-    # a) Find all vertices near x_slice (within tol)
+    # 1) Find any vertex within tol of x_slice
     tol = 1e-6
     x_coords = verts[:, 0]
     slice_mask = np.abs(x_coords - x_slice) < tol
     slice_verts = np.nonzero(slice_mask)[0]
 
-    # b) Remove any face that references a slice_vert
+    # 2) Remove all faces that reference slice_verts
     keep_faces = []
     for tri in faces:
         if any(v in slice_verts for v in tri):
@@ -333,21 +335,21 @@ def slice_and_insert_hex(verts, faces, x_slice, f2f_top, f2f_bot, depth):
         keep_faces.append(tri)
     keep_faces = np.array(keep_faces, dtype=int)
 
-    # c) Build unit hex‐prism (centered at x=0) in Y–Z
+    # 3) Build a “unit” hex prism at x=0
     verts_hex_unit, faces_hex_unit = build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness)
 
-    # d) Translate hex‐unit verts so that x = x_slice
+    # 4) Translate hex prism to x = x_slice
     verts_hex = verts_hex_unit.copy()
     verts_hex[:, 0] += x_slice
 
-    # e) Combine vertex arrays
+    # 5) Append hex vertices to original verts
     n_old = verts.shape[0]
-    verts_new = np.vstack([verts, verts_hex])
+    verts_new = np.vstack([verts, verts_hex])  # now size = n_old + 12
 
-    # f) Reindex hex faces to refer to new vertex indices (offset by n_old)
+    # 6) Reindex hex faces by offsetting with n_old
     faces_hex = faces_hex_unit + n_old
 
-    # g) Combine faces
+    # 7) Combine
     faces_new = np.vstack([keep_faces, faces_hex])
 
     return verts_new, faces_new
@@ -501,7 +503,7 @@ with tab2:
                         stl_text = write_stl_ascii(verts_final, faces_final, solid_name=stl_name)
                         stl_bytes = stl_text.encode("utf-8")
 
-                        # 5) Three.js Preview (same as before)
+                        # 5) Three.js Preview (identical to before)
                         b64 = base64.b64encode(stl_bytes).decode()
                         html = f"""
                         <!DOCTYPE html>
