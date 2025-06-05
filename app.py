@@ -189,12 +189,117 @@ def write_stl_ascii(vertices, faces, solid_name="airfoil_extrusion"):
     return output.getvalue()
 
 # -------------------------
+# Hex-hole carving helpers
+# -------------------------
+
+def subtract_tapered_hex(verts, faces, cx, cy, top_f2f, bot_f2f, depth, foil_thickness):
+    """
+    Remove any triangular face whose centroid falls inside the tapered hex volume:
+    - Hex top at Z=foil_thickness has flat-to-flat = top_f2f
+    - Hex bottom at Z=foil_thickness - depth has flat-to-flat = bot_f2f
+    Returns (new_verts, new_faces) with unused vertices trimmed.
+    """
+    z_top = foil_thickness
+    z_bot = z_top - depth
+    kept = []
+    cos30 = np.cos(np.pi/6)
+    sin30 = np.sin(np.pi/6)
+
+    for tri in faces:
+        centroid = verts[tri].mean(axis=0)
+        x_c, y_c, z_c = centroid
+        # 1) Check Z within hex region
+        if not (z_bot <= z_c <= z_top):
+            kept.append(tri)
+            continue
+        lam = (z_top - z_c) / depth
+        f2f_at_z = top_f2f - lam * (top_f2f - bot_f2f)
+        dx = x_c - cx
+        dy = y_c - cy
+        # Rotate point by -30° to align hex flats with axes
+        x_r = dx * cos30 + dy * sin30
+        y_r = -dx * sin30 + dy * cos30
+        # If inside hex cross‐section, discard
+        if max(abs(x_r), abs(y_r) / cos30) <= (f2f_at_z / 2.0):
+            continue
+        kept.append(tri)
+
+    if not kept:
+        return np.zeros((0,3)), np.zeros((0,3), dtype=int)
+
+    kept = np.array(kept, dtype=int)
+    unique_v = np.unique(kept.flatten())
+    idx_map = {old: new for new, old in enumerate(unique_v)}
+    new_verts = verts[unique_v]
+    new_faces = np.vectorize(lambda i: idx_map[i])(kept)
+    return new_verts, new_faces
+
+def extrude_and_carve_hex(xy_points, thickness_mm, num_interp,
+                          scale, top_f2f, bot_f2f, depth):
+    """
+    1) Resample and scale the 2D airfoil profile
+    2) Extrude to a 3D plate
+    3) Find x-location of maximum vertical thickness (max(y_upper - y_lower))
+       and set hex center at (x_max_thick, 0)
+    4) Carve a tapered hex hole through the thickness
+    Returns (verts_final, faces_final).
+    """
+    # 1) Resample and scale
+    contour = resample_profile_xy(xy_points, num_interp)
+    contour *= scale  # scale X/Y
+
+    # 2) Extrude
+    n = contour.shape[0]
+    vertices = np.zeros((2 * n, 3), dtype=float)
+    for i in range(n):
+        x_val, y_val = contour[i]
+        vertices[i]     = [x_val, y_val, 0.0]
+        vertices[n + i] = [x_val, y_val, thickness_mm]
+    faces = []
+    bottom_triangles = triangulate_polygon(contour)
+    for (i, j, k) in bottom_triangles:
+        faces.append([i, k, j])
+    for (i, j, k) in bottom_triangles:
+        faces.append([n + i, n + j, n + k])
+    for i in range(n):
+        i_next = (i + 1) % n
+        b0 = i
+        b1 = i_next
+        t0 = n + i
+        t1 = n + i_next
+        faces.append([b0, b1, t1])
+        faces.append([b0, t1, t0])
+    faces = np.array(faces, dtype=int)
+
+    # 3) Compute chordwise thickness: at each unique x, find max(y) - min(y)
+    unique_x = np.unique(np.round(contour[:, 0], 8))
+    max_thick = 0.0
+    x_of_max = contour[0, 0]
+    for ux in unique_x:
+        ys_at_x = contour[np.isclose(contour[:, 0], ux, atol=1e-6), 1]
+        if len(ys_at_x) >= 2:
+            thickness_here = ys_at_x.max() - ys_at_x.min()
+            if thickness_here > max_thick:
+                max_thick = thickness_here
+                x_of_max = ux
+
+    cx = x_of_max
+    cy = 0.0  # centerline
+
+    # 4) Carve hex hole
+    verts_carved, faces_carved = subtract_tapered_hex(
+        vertices, faces, cx, cy, top_f2f, bot_f2f, depth, thickness_mm
+    )
+
+    return verts_carved, faces_carved, (contour, cx, cy)
+
+# -------------------------
 # Tab 1: View Airfoil
 # -------------------------
 with tab1:
     st.header("View Airfoil Profile")
     dat_file_v = st.file_uploader(
-        "Upload `.dat` to view (first line is description)", 
+        "Upload `.dat` to view (first line is description)",
         type=["dat"], key="view"
     )
     if dat_file_v:
@@ -212,115 +317,176 @@ with tab1:
 # Tab 2: Extrude to STL
 # -------------------------
 with tab2:
-    st.header("Extrude Airfoil to STL")
+    st.header("Extrude Airfoil to STL with Tapered Hex Hole")
+
     dat_file_e = st.file_uploader(
-        "Upload `.dat` for extrusion (first line is description)", 
+        "Upload `.dat` for extrusion (first line is description)",
         type=["dat"], key="extrude"
     )
     if dat_file_e:
         raw_bytes = dat_file_e.read()
         coords_e = load_dat_coords(raw_bytes)
 
-        st.subheader("Parameters")
-        col1, col2 = st.columns(2)
-        with col1:
-            scale_factor = st.number_input(
-                "Scaling factor (e.g., chord in mm per unit)",
-                value=100.0,
-                format="%.3f"
-            )
-        with col2:
-            thickness = st.number_input(
-                "Extrusion thickness (mm)",
-                value=1.0,
-                format="%.3f"
-            )
-
-        st.subheader("Optional: Resampled Preview")
-        num_pts = st.slider("Resample points", min_value=50, max_value=500, value=300, step=10)
-        scaled_coords = coords_e * scale_factor
-        contour_preview = resample_profile_xy(scaled_coords, num_pts)
-        fig_e = plot_2d_profile(contour_preview, title="Resampled & Scaled (Preview)")
-        st.pyplot(fig_e)
-
-        st.subheader("Generate & Preview STL")
-        stl_name = st.text_input("Filename (no extension)", value="airfoil_extrusion")
-        if not stl_name:
-            st.error("Please enter a valid filename.")
+        if coords_e.shape[0] < 3:
+            st.error("Failed to parse enough points from the DAT. Please upload a valid airfoil file.")
         else:
-            if st.button("Create STL"):
-                verts, faces = extrude_to_vertices_faces(scaled_coords, thickness, num_interp=num_pts)
-                stl_text = write_stl_ascii(verts, faces, solid_name=stl_name)
-                stl_bytes = stl_text.encode("utf-8")
+            # -------------------------
+            # Parameters
+            # -------------------------
+            st.subheader("Parameters")
 
-                # 1) Show 3D preview via Three.js embedded HTML
-                b64 = base64.b64encode(stl_bytes).decode()
-                html = f"""
-                <!DOCTYPE html>
-                <html lang="en">
-                <head>
-                  <meta charset="UTF-8" />
-                  <title>STL Preview</title>
-                  <style>
-                    body {{ margin: 0; }}
-                    #viewer {{ width: 100%; height: 400px; }}
-                  </style>
-                </head>
-                <body>
-                  <div id="viewer"></div>
-                  <script src="https://cdn.jsdelivr.net/npm/three@0.150/build/three.min.js"></script>
-                  <script src="https://cdn.jsdelivr.net/npm/three@0.150/examples/js/loaders/STLLoader.js"></script>
-                  <script>
-                    const scene = new THREE.Scene();
-                    const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
-                    const renderer = new THREE.WebGLRenderer({{ antialias: true }});
-                    renderer.setSize(window.innerWidth, 400);
-                    document.getElementById('viewer').appendChild(renderer.domElement);
-
-                    const ambient = new THREE.AmbientLight(0x404040);
-                    scene.add(ambient);
-                    const directional = new THREE.DirectionalLight(0xffffff, 1);
-                    directional.position.set(1, 1, 1).normalize();
-                    scene.add(directional);
-
-                    const loader = new THREE.STLLoader();
-                    loader.load('data:application/sla;base64,{b64}', function (geometry) {{
-                      const material = new THREE.MeshNormalMaterial();
-                      const mesh = new THREE.Mesh(geometry, material);
-                      scene.add(mesh);
-
-                      const box = new THREE.Box3().setFromObject(mesh);
-                      const size = box.getSize(new THREE.Vector3()).length();
-                      const center = box.getCenter(new THREE.Vector3());
-
-                      mesh.position.x += (mesh.position.x - center.x);
-                      mesh.position.y += (mesh.position.y - center.y);
-                      mesh.position.z += (mesh.position.z - center.z);
-
-                      camera.position.set(center.x, center.y, size * 2);
-                      camera.lookAt(center);
-
-                      function animate() {{
-                        requestAnimationFrame(animate);
-                        mesh.rotation.x += 0.01;
-                        mesh.rotation.y += 0.01;
-                        renderer.render(scene, camera);
-                      }}
-                      animate();
-                    }});
-                  </script>
-                </body>
-                </html>
-                """
-                st.components.v1.html(html, height=420)
-
-                # 2) Download button
-                st.download_button(
-                    label="Download `.stl`",
-                    data=stl_bytes,
-                    file_name=f"{stl_name}.stl",
-                    mime="application/vnd.ms-pki.stl"
+            col1, col2 = st.columns(2)
+            with col1:
+                scale_factor = st.number_input(
+                    "Scaling factor (e.g., chord in mm per unit)",
+                    value=100.0,
+                    format="%.3f"
                 )
-                st.success(f"STL `{stl_name}.stl` is ready!")
+            with col2:
+                thickness = st.number_input(
+                    "Extrusion thickness (Z) [mm]",
+                    value=1.0,
+                    format="%.3f"
+                )
+
+            # -------------------------
+            # Preview overall size
+            # -------------------------
+            st.subheader("Airfoil Bounding-Box (X, Y, Z)")
+
+            xs_scaled = coords_e[:, 0] * scale_factor
+            ys_scaled = coords_e[:, 1] * scale_factor
+            x_min, x_max = xs_scaled.min(), xs_scaled.max()
+            y_min, y_max = ys_scaled.min(), ys_scaled.max()
+            z_min, z_max = 0.0, thickness
+
+            st.write(f"• X span: {x_max - x_min:.3f} mm  (from {x_min:.3f} to {x_max:.3f})")
+            st.write(f"• Y span: {y_max - y_min:.3f} mm  (from {y_min:.3f} to {y_max:.3f})")
+            st.write(f"• Z span: {z_max - z_min:.3f} mm")
+
+            # -------------------------
+            # Optional: Resampled Preview
+            # -------------------------
+            st.subheader("Optional: Resampled Preview")
+            num_pts = st.slider(
+                "Resample points for smoothness",
+                min_value=50, max_value=500, value=300, step=10
+            )
+            scaled_coords = coords_e * scale_factor
+            contour_preview = resample_profile_xy(scaled_coords, num_pts)
+            fig_e = plot_2d_profile(contour_preview, title="Resampled & Scaled (Preview)")
+            st.pyplot(fig_e)
+
+            # -------------------------
+            # Hex-hole parameters
+            # -------------------------
+            st.subheader("Tapered Hex-Hole Parameters")
+            col1h, col2h, col3h = st.columns(3)
+            with col1h:
+                top_f2f = st.number_input(
+                    "Hexagon top flat-to-flat [mm]",
+                    min_value=0.5, value=5.0, step=0.1
+                )
+            with col2h:
+                bot_f2f = st.number_input(
+                    "Hexagon bottom flat-to-flat [mm]",
+                    min_value=0.1, value=4.8, step=0.1
+                )
+            with col3h:
+                depth = st.number_input(
+                    "Hexagon hole depth [mm]",
+                    min_value=0.1, max_value=thickness, value=thickness, step=0.1
+                )
+
+            # -------------------------
+            # Generate & Preview STL
+            # -------------------------
+            st.subheader("Generate & Preview STL")
+            stl_name = st.text_input("Filename (no extension)", value="airfoil_extrusion")
+            if not stl_name:
+                st.error("Please enter a valid filename.")
+            else:
+                if st.button("Create STL with Hex Hole"):
+                    verts_final, faces_final, (contour_scaled, cx, cy) = extrude_and_carve_hex(
+                        coords_e, thickness, num_interp=num_pts,
+                        scale=scale_factor, top_f2f=top_f2f, bot_f2f=bot_f2f, depth=depth
+                    )
+                    if verts_final.size == 0:
+                        st.error("Hex hole removed entire mesh. Try smaller hex or shallower depth.")
+                    else:
+                        # 1) Generate ASCII STL bytes
+                        stl_text = write_stl_ascii(verts_final, faces_final, solid_name=stl_name)
+                        stl_bytes = stl_text.encode("utf-8")
+
+                        # 2) Show 3D preview via Three.js embedded HTML
+                        b64 = base64.b64encode(stl_bytes).decode()
+                        html = f"""
+                        <!DOCTYPE html>
+                        <html lang="en">
+                        <head>
+                          <meta charset="UTF-8" />
+                          <title>STL Preview</title>
+                          <style>
+                            body {{ margin: 0; }}
+                            #viewer {{ width: 100%; height: 400px; }}
+                          </style>
+                        </head>
+                        <body>
+                          <div id="viewer"></div>
+                          <script src="https://cdn.jsdelivr.net/npm/three@0.150/build/three.min.js"></script>
+                          <script src="https://cdn.jsdelivr.net/npm/three@0.150/examples/js/loaders/STLLoader.js"></script>
+                          <script>
+                            const scene = new THREE.Scene();
+                            const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
+                            const renderer = new THREE.WebGLRenderer({{ antialias: true }});
+                            renderer.setSize(window.innerWidth, 400);
+                            document.getElementById('viewer').appendChild(renderer.domElement);
+
+                            const ambient = new THREE.AmbientLight(0x404040);
+                            scene.add(ambient);
+                            const directional = new THREE.DirectionalLight(0xffffff, 1);
+                            directional.position.set(1, 1, 1).normalize();
+                            scene.add(directional);
+
+                            const loader = new THREE.STLLoader();
+                            loader.load('data:application/sla;base64,{b64}', function (geometry) {{
+                              const material = new THREE.MeshNormalMaterial();
+                              const mesh = new THREE.Mesh(geometry, material);
+                              scene.add(mesh);
+
+                              const box = new THREE.Box3().setFromObject(mesh);
+                              const size = box.getSize(new THREE.Vector3()).length();
+                              const center = box.getCenter(new THREE.Vector3());
+
+                              mesh.position.x += (mesh.position.x - center.x);
+                              mesh.position.y += (mesh.position.y - center.y);
+                              mesh.position.z += (mesh.position.z - center.z);
+
+                              camera.position.set(center.x, center.y, size * 2);
+                              camera.lookAt(center);
+
+                              function animate() {{
+                                requestAnimationFrame(animate);
+                                mesh.rotation.x += 0.01;
+                                mesh.rotation.y += 0.01;
+                                renderer.render(scene, camera);
+                              }}
+                              animate();
+                            }});
+                          </script>
+                        </body>
+                        </html>
+                        """
+                        st.components.v1.html(html, height=420)
+
+                        # 3) Download button
+                        st.download_button(
+                            label="Download `.stl`",
+                            data=stl_bytes,
+                            file_name=f"{stl_name}.stl",
+                            mime="application/vnd.ms-pki.stl"
+                        )
+                        st.success(f"STL `{stl_name}.stl` is ready!")
+
     else:
         st.info("Upload a `.dat` file to enable extrusion.")
