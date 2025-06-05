@@ -6,10 +6,6 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import base64
 
-# ----- New import for mesh‐boolean and repairs -----
-import trimesh  
-from trimesh.repair import fill_holes, fix_normals  
-
 st.set_page_config(page_title="Airfoil Toolkit", layout="centered")
 st.title("Airfoil Toolkit")
 
@@ -22,10 +18,12 @@ tab1, tab2 = st.tabs(["View Airfoil", "Extrude to STL"])
 
 def load_dat_coords(dat_bytes):
     """
-    Parse .dat bytes into an (N×2) numpy array of (x, y).
+    Given raw bytes of a .dat file (UTF-8), skip the first line,
+    parse the remaining lines as two-column floats,
+    and return an (N×2) numpy array.
     """
     raw_lines = dat_bytes.decode("utf-8", errors="ignore").splitlines()
-    coord_lines = raw_lines[1:]  # skip header
+    coord_lines = raw_lines[1:]  # skip first-line description
     pts = []
     for line in coord_lines:
         line = line.strip()
@@ -38,13 +36,14 @@ def load_dat_coords(dat_bytes):
                 y_val = float(parts[1])
                 pts.append([x_val, y_val])
             except ValueError:
-                continue
+                pass
     return np.array(pts, dtype=float)
 
 
 def plot_2d_profile(coords, title="Airfoil Profile"):
     """
-    Given an (N×2) array, plot x vs. y with equal axis.
+    Given an (N×2) array of coordinates, plot x vs. y with equal axis.
+    Returns the Matplotlib figure.
     """
     fig, ax = plt.subplots(figsize=(5, 2.5))
     ax.plot(coords[:, 0], coords[:, 1], "-k", linewidth=2)
@@ -73,6 +72,9 @@ def resample_profile_xy(xy, num_pts=200):
 
 
 def point_in_triangle(pt, a, b, c):
+    """
+    Return True if point pt lies inside triangle (a,b,c) in 2D.
+    """
     v0 = c - a
     v1 = b - a
     v2 = pt - a
@@ -91,6 +93,9 @@ def point_in_triangle(pt, a, b, c):
 
 
 def is_convex(prev_pt, curr_pt, next_pt):
+    """
+    Return True if prev_pt→curr_pt→next_pt is a convex “ear” in CCW ordering.
+    """
     v1 = prev_pt - curr_pt
     v2 = next_pt - curr_pt
     cross_z = v1[0] * v2[1] - v1[1] * v2[0]
@@ -99,8 +104,8 @@ def is_convex(prev_pt, curr_pt, next_pt):
 
 def triangulate_polygon(contour_xy):
     """
-    Ear‐clipping triangulation on a CCW 2D contour.
-    Returns list of index triples.
+    Ear‐clipping triangulation for a CCW 2D contour (N×2).
+    Returns a list of index‐triples (i,j,k).
     """
     n = len(contour_xy)
     if n < 3:
@@ -143,22 +148,27 @@ def triangulate_polygon(contour_xy):
 
 def extrude_to_vertices_faces(xy_points, thickness_mm, num_interp=200):
     """
-    Resample xy_points to num_interp, then build vertices/faces for extrusion.
-    Returns vertices (2n×3) and faces (F×3).
+    1) Resample xy_points via spline to num_interp (smooth contour).  
+    2) Build a 3D “plate” with bottom at z=0 and top at z=thickness_mm.  
+    3) Triangulate the 2D contour for bottom & top caps.  
+    4) Add side‐wall faces.  
+    Returns (vertices (2n×3), faces (F×3)).
     """
     contour = resample_profile_xy(xy_points, num_interp)
     n = contour.shape[0]
     vertices = np.zeros((2 * n, 3), dtype=float)
     for i in range(n):
         x_val, y_val = contour[i]
-        vertices[i]     = [x_val, y_val, 0.0]
+        vertices[i] = [x_val, y_val, 0.0]
         vertices[n + i] = [x_val, y_val, thickness_mm]
+
     faces = []
-    bottom_triangles = triangulate_polygon(contour)
-    for (i, j, k) in bottom_triangles:
-        faces.append([i, k, j])
-    for (i, j, k) in bottom_triangles:
-        faces.append([n + i, n + j, n + k])
+    bottom_tris = triangulate_polygon(contour)
+    for (i, j, k) in bottom_tris:
+        faces.append([i, k, j])            # bottom face
+    for (i, j, k) in bottom_tris:
+        faces.append([n + i, n + j, n + k])  # top face
+
     for i in range(n):
         i_next = (i + 1) % n
         b0 = i
@@ -167,12 +177,13 @@ def extrude_to_vertices_faces(xy_points, thickness_mm, num_interp=200):
         t1 = n + i_next
         faces.append([b0, b1, t1])
         faces.append([b0, t1, t0])
+
     return vertices, np.array(faces, dtype=int)
 
 
 def write_stl_ascii(vertices, faces, solid_name="airfoil_extrusion"):
     """
-    Write ASCII STL from vertices/faces. Return as string.
+    Write an ASCII STL string from (vertices, faces). Return as a single string.
     """
     def compute_normal(v1, v2, v3):
         n = np.cross(v2 - v1, v3 - v1)
@@ -180,6 +191,7 @@ def write_stl_ascii(vertices, faces, solid_name="airfoil_extrusion"):
         if length == 0:
             return np.array([0.0, 0.0, 0.0], dtype=float)
         return n / length
+
     output = io.StringIO()
     output.write(f"solid {solid_name}\n")
     for tri in faces:
@@ -199,65 +211,14 @@ def write_stl_ascii(vertices, faces, solid_name="airfoil_extrusion"):
 
 
 # -------------------------
-# 2) Hex‐prism construction & membership test
+# 2) Utility: find x_of_max_thick
 # -------------------------
-
-def build_tapered_hex_prism(cx, cy, top_f2f, bot_f2f, depth, top_z):
-    """
-    Build a standalone 3D mesh for a *tapered hex prism*:
-      - The top hex face (at z=top_z) has flat‐to‐flat = top_f2f.
-      - The bottom hex face (at z=top_z - depth) has flat‐to‐flat = bot_f2f.
-      - Centered horizontally at (cx, cy).
-
-    Returns (verts_hex, faces_hex) where:
-    - verts_hex is (12×3) array (6 top corners + 6 bottom corners).
-    - faces_hex is (12×3) integer array of triangle indices:
-       • 6 quads for the sides (split each into 2 triangles → 12 triangles)
-       • 4 triangles for top cap (fan)
-       • 4 triangles for bottom cap (fan, flipped)
-    """
-    def hex_corners(f2f, x0, y0, z):
-        R = (f2f / 2.0) / np.cos(np.pi / 6)
-        pts = []
-        for k in range(6):
-            theta = np.pi / 6 + k * (np.pi / 3)  # 30°, 90°, 150°, ...
-            x = x0 + R * np.cos(theta)
-            y = y0 + R * np.sin(theta)
-            pts.append([x, y, z])
-        return np.array(pts, dtype=float)
-
-    top_pts = hex_corners(top_f2f, cx, cy, top_z)
-    bot_pts = hex_corners(bot_f2f, cx, cy, top_z - depth)
-    verts_hex = np.vstack([top_pts, bot_pts])  # (12×3)
-
-    faces = []
-    # 2) Side‐walls
-    for i in range(6):
-        i_next = (i + 1) % 6
-        top_i = i
-        top_inext = i_next
-        bot_i = 6 + i
-        bot_inext = 6 + i_next
-        faces.append([top_i, top_inext, bot_inext])
-        faces.append([top_i, bot_inext, bot_i])
-
-    # 3) Top hex cap fan (0,1,2),(0,2,3),(0,3,4),(0,4,5)
-    for i in range(1, 5):
-        faces.append([0, i, i + 1])
-    # 4) Bottom hex cap fan (flip)
-    base = 6
-    for i in range(1, 5):
-        faces.append([base, base + i + 1, base + i])
-    faces.append([base, base + 7, base + 11])
-
-    return verts_hex, np.array(faces, dtype=int)
-
 
 def find_max_thickness_x(contour, num_samples=500):
     """
-    Given a 2D contour (N×2), sample num_samples x‐values from min(x) to max(x).
-    At each xg, find where the polygon intersects the vertical line x=xg.
-    Compute thickness = max(intersect_ys) - min(intersect_ys). Return the xg that maximizes thickness.
+    Given a 2D contour (N×2), sample num_samples x-values uniformly.
+    For each xg, compute the intersection Y’s of contour vs. line x=xg,
+    find vertical thickness = max(Y)-min(Y). Return the xg with max thickness.
     """
     xs = contour[:, 0]
     minx, maxx = xs.min(), xs.max()
@@ -277,21 +238,128 @@ def find_max_thickness_x(contour, num_samples=500):
         if len(y_ints) >= 2:
             y_top = max(y_ints)
             y_bot = min(y_ints)
-            thickness_here = y_top - y_bot
-            if thickness_here > best_thk:
-                best_thk = thickness_here
+            thk = y_top - y_bot
+            if thk > best_thk:
+                best_thk = thk
                 best_x = xg
 
     return best_x
 
 
 # -------------------------
-# 3) TAB 1: View Airfoil
+# 3) Build hex prism in Y–Z plane at x = 0 (unit f2f = 1)
+#    → we'll translate & scale later
+# -------------------------
+
+def build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness):
+    """
+    Build a “unit” hex prism whose axis is the z-axis, centered at (y=0,z=thickness/2).
+    Top flat-to-flat at z=thickness is f2f_top; bottom flat-to-flat (z=thickness-depth) is f2f_bot.
+    All coordinates are (x=0, y, z). Return (verts_hex, faces_hex) in (x,y,z).
+    We’ll later scale y by (f2f_actual / f2f_top) or similar.
+    """
+    # _Actually_, we want the hex in the Y–Z plane (since x is constant slice).
+    # But our hole axis is _along z_, so the hex cross-sections live in the y-axis for each z.
+    # We'll build 6 corners at top z & 6 corners at bottom z, all at x=0.
+
+    def hex_corners(f2f, center_y, center_z):
+        R = (f2f / 2.0) / np.cos(np.pi / 6)  # circumradius
+        pts = []
+        for k in range(6):
+            theta = np.pi / 6 + k * (np.pi / 3)  # 30°, 90°, 150°, ...
+            y = center_y + R * np.cos(theta)
+            z = center_z + R * np.sin(theta)
+            pts.append([0.0, y, z])
+        return np.array(pts, dtype=float)
+
+    # Top center: (x=0, y=0, z=thickness)
+    top_center_z = thickness
+    bottom_center_z = thickness - depth
+    top_pts = hex_corners(f2f_top, 0.0, top_center_z)
+    bot_pts = hex_corners(f2f_bot, 0.0, bottom_center_z)
+
+    verts_hex = np.vstack([top_pts, bot_pts])  # (12×3)
+
+    faces = []
+    # 1) Side walls (6 quads → 12 triangles)
+    for i in range(6):
+        i_next = (i + 1) % 6
+        top_i = i
+        top_inext = i_next
+        bot_i = 6 + i
+        bot_inext = 6 + i_next
+        faces.append([top_i, top_inext, bot_inext])
+        faces.append([top_i, bot_inext, bot_i])
+
+    # 2) Top hex cap: fan around vertex 0
+    for i in range(1, 5):
+        faces.append([0, i, i + 1])
+    # 3) Bottom hex cap: fan around vertex 6 (flip winding)
+    base = 6
+    for i in range(1, 5):
+        faces.append([base, base + i + 1, base + i])
+    faces.append([base, base + 7, base + 11])
+
+    return verts_hex, np.array(faces, dtype=int)
+
+
+# -------------------------
+# 4) “Slice‐and‐Rebuild” Carving
+# -------------------------
+
+def slice_and_insert_hex(verts, faces, x_slice, f2f_top, f2f_bot, depth):
+    """
+    1) Identify all vertices whose |x - x_slice| < tol. Collect their indices as slice_verts.
+    2) Remove every face that uses any of slice_verts → leftover_faces.
+    3) Build a perfect hex prism at x=0 in Y–Z (unit) via build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness).
+    4) Translate those hex‐prism vertices to x = x_slice (i.e. add x_slice to their x‐coordinate).
+    5) Append hex‐verts to the existing vertex list, and append hex‐faces (with reindexed indices).
+    6) Return the new combined ( verts_new, faces_new ).
+    """
+
+    thickness = np.max(verts[:, 2])  # should equal thickness input
+
+    # a) Find all vertices near x_slice (within tol)
+    tol = 1e-6
+    x_coords = verts[:, 0]
+    slice_mask = np.abs(x_coords - x_slice) < tol
+    slice_verts = np.nonzero(slice_mask)[0]
+
+    # b) Remove any face that references a slice_vert
+    keep_faces = []
+    for tri in faces:
+        if any(v in slice_verts for v in tri):
+            continue
+        keep_faces.append(tri)
+    keep_faces = np.array(keep_faces, dtype=int)
+
+    # c) Build unit hex‐prism (centered at x=0) in Y–Z
+    verts_hex_unit, faces_hex_unit = build_unit_hex_prism(f2f_top, f2f_bot, depth, thickness)
+
+    # d) Translate hex‐unit verts so that x = x_slice
+    verts_hex = verts_hex_unit.copy()
+    verts_hex[:, 0] += x_slice
+
+    # e) Combine vertex arrays
+    n_old = verts.shape[0]
+    verts_new = np.vstack([verts, verts_hex])
+
+    # f) Reindex hex faces to refer to new vertex indices (offset by n_old)
+    faces_hex = faces_hex_unit + n_old
+
+    # g) Combine faces
+    faces_new = np.vstack([keep_faces, faces_hex])
+
+    return verts_new, faces_new
+
+
+# -------------------------
+# 5) TAB 1: View Airfoil
 # -------------------------
 with tab1:
     st.header("View Airfoil Profile")
     dat_file_v = st.file_uploader(
-        "Upload `.dat` to view (first line is description)",
+        "Upload `.dat` to view (first line is description)", 
         type=["dat"], key="view"
     )
     if dat_file_v:
@@ -310,14 +378,13 @@ with tab1:
 
 
 # -------------------------
-# 4) TAB 2: Extrude to STL + Boolean‐Hex
+# 6) TAB 2: Extrude to STL + Slice‐&‐Rebuild
 # -------------------------
 with tab2:
-    st.header("Extrude Airfoil to STL with Tapered Hex Hole (Boolean)")
+    st.header("Extrude Airfoil to STL with Tapered Hex Hole")
 
-    # 1) File upload
     dat_file_e = st.file_uploader(
-        "Upload `.dat` for extrusion (first line is description)",
+        "Upload `.dat` for extrusion (first line is description)", 
         type=["dat"], key="extrude"
     )
     if dat_file_e:
@@ -325,23 +392,29 @@ with tab2:
         coords_e = load_dat_coords(raw_bytes)
 
         if coords_e.shape[0] < 3:
-            st.error("Failed to parse enough points. Please upload a valid airfoil `.dat`.")
+            st.error("Failed to parse enough points. Please upload a valid airfoil DAT.")
         else:
-            # 2) Parameters
+            # ——————————————
+            # Parameters
+            # ——————————————
             st.subheader("Parameters")
             col1, col2 = st.columns(2)
             with col1:
                 scale_factor = st.number_input(
-                    "Scaling factor (mm per unit chord)",
-                    value=100.0, format="%.3f"
+                    "Scaling factor (e.g., chord in mm per unit)",
+                    value=100.0,
+                    format="%.3f"
                 )
             with col2:
                 thickness = st.number_input(
                     "Extrusion thickness (mm)",
-                    value=1.0, format="%.3f"
+                    value=1.0,
+                    format="%.3f"
                 )
 
-            # 3) Bounding‐Box Preview
+            # ——————————————
+            # Bounding‐Box Preview
+            # ——————————————
             st.subheader("Airfoil Bounding-Box (X, Y, Z)")
             xs_scaled = coords_e[:, 0] * scale_factor
             ys_scaled = coords_e[:, 1] * scale_factor
@@ -352,7 +425,9 @@ with tab2:
             st.write(f"• Y span: {y_max - y_min:.3f} mm   (from {y_min:.3f} to {y_max:.3f})")
             st.write(f"• Z span: {z_max - z_min:.3f} mm")
 
-            # 4) Optional: Resampled Preview
+            # ——————————————
+            # Optional: Resampled Preview
+            # ——————————————
             st.subheader("Optional: Resampled Preview")
             num_pts = st.slider(
                 "Resample points for smoothness",
@@ -363,7 +438,9 @@ with tab2:
             fig_e = plot_2d_profile(contour_preview, title="Resampled & Scaled (Preview)")
             st.pyplot(fig_e)
 
-            # 5) Hex‐Hole parameters
+            # ——————————————
+            # Hex‐Hole Parameters
+            # ——————————————
             st.subheader("Tapered Hex‐Hole Parameters")
             col1h, col2h, col3h = st.columns(3)
             with col1h:
@@ -382,55 +459,34 @@ with tab2:
                     min_value=0.1, max_value=thickness, value=thickness, step=0.1
                 )
 
-            # 6) Generate & Preview STL
+            # ——————————————
+            # Generate & Preview STL
+            # ——————————————
             st.subheader("Generate & Preview STL")
             stl_name = st.text_input("Filename (no extension)", value="airfoil_extrusion")
             if not stl_name.strip():
                 st.error("Please enter a valid filename.")
             else:
                 if st.button("Create STL with Hex Hole"):
-                    # a) Build the extruded foil mesh
+                    # 1) Build the extruded foil mesh
                     verts_foil, faces_foil = extrude_to_vertices_faces(
                         scaled_coords, thickness, num_interp=num_pts
                     )
 
-                    # b) Find the unscaled x at max thickness
+                    # 2) Find the unscaled x at max thickness
                     unscaled_contour = resample_profile_xy(coords_e, num_pts)
                     x_unscaled_max = find_max_thickness_x(unscaled_contour, num_samples=500)
                     cx = x_unscaled_max * scale_factor
                     cy = 0.0
 
-                    # c) Build the tapered hex‐prism mesh
-                    verts_hex, faces_hex = build_tapered_hex_prism(
-                        cx, cy, top_f2f, bot_f2f, depth, top_z=thickness
+                    # 3) Slice‐and‐Rebuild
+                    verts_final, faces_final = slice_and_insert_hex(
+                        verts_foil, faces_foil,
+                        x_slice=cx,
+                        f2f_top=top_f2f,
+                        f2f_bot=bot_f2f,
+                        depth=depth
                     )
-
-                    # d) Convert both to trimesh.Trimesh with process=False
-                    foil_mesh = trimesh.Trimesh(vertices=verts_foil, faces=faces_foil, process=False)
-                    hex_mesh  = trimesh.Trimesh(vertices=verts_hex,  faces=faces_hex,  process=False)
-
-                    # e) Attempt to repair watertightness manually
-                    if not foil_mesh.is_watertight:
-                        fill_holes(foil_mesh)
-                        fix_normals(foil_mesh)
-                    if not hex_mesh.is_watertight:
-                        fill_holes(hex_mesh)
-                        fix_normals(hex_mesh)
-
-                    if not foil_mesh.is_watertight or not hex_mesh.is_watertight:
-                        st.error("Could not make meshes watertight for boolean difference. "
-                                 "Try increasing mesh resolution or checking parameters.")
-                        st.stop()
-
-                    # f) Perform boolean difference
-                    try:
-                        result_mesh = foil_mesh.difference(hex_mesh)
-                    except BaseException as e:
-                        st.error(f"Boolean‐difference failed: {e}")
-                        st.stop()
-
-                    verts_final = result_mesh.vertices
-                    faces_final = result_mesh.faces
 
                     # Inform user where the hole was placed
                     st.info(
@@ -439,13 +495,13 @@ with tab2:
                     )
 
                     if verts_final.size == 0 or faces_final.size == 0:
-                        st.error("Resulting mesh is empty—perhaps the hex was too large or depth too great.")
+                        st.error("Something went wrong (resulting mesh is empty).")
                     else:
-                        # 7) Generate ASCII STL text
+                        # 4) Generate ASCII STL text
                         stl_text = write_stl_ascii(verts_final, faces_final, solid_name=stl_name)
                         stl_bytes = stl_text.encode("utf-8")
 
-                        # 8) Show Three.js preview via embedded HTML
+                        # 5) Three.js Preview (same as before)
                         b64 = base64.b64encode(stl_bytes).decode()
                         html = f"""
                         <!DOCTYPE html>
@@ -506,7 +562,7 @@ with tab2:
                         """
                         st.components.v1.html(html, height=420)
 
-                        # 9) Download button
+                        # 6) Download button
                         st.download_button(
                             label="Download `.stl`",
                             data=stl_bytes,
