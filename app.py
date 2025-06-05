@@ -386,14 +386,16 @@ with tab1:
 
 
 # -------------------------
-# 6) TAB 2: Extrude to STL + Drill Hex Hole (Corrected)
+# Tab 2: Extrude to STL + Drill Hex Hole (Through‐Hole Version)
 # -------------------------
 with tab2:
-    st.header("Extrude Airfoil to STL + Drill Hex Hole")
+    st.header("Extrude Airfoil to STL + Drill Hex Hole (Through Hole)")
 
+    # 1) Upload a DAT
     dat_file_e = st.file_uploader(
-        "Upload `.dat` for extrusion (first line is description)", 
-        type=["dat"], key="extrude"
+        "Upload `.dat` for extrusion (first line is description)",
+        type=["dat"],
+        key="extrude"
     )
 
     if dat_file_e:
@@ -403,7 +405,7 @@ with tab2:
         if coords_e.shape[0] < 3:
             st.error("Failed to parse enough points. Please upload a valid airfoil DAT.")
         else:
-            # 1) Main parameters
+            # 2) Extrusion parameters
             st.subheader("Parameters")
             col1, col2 = st.columns(2)
             with col1:
@@ -419,99 +421,128 @@ with tab2:
                     format="%.3f"
                 )
 
-            # 2) Show bounding‐box in (X, Y, Z)
+            # 3) Show bounding‐box in X/Y/Z (scaled)
             st.subheader("Airfoil Bounding-Box (X, Y, Z)")
-            xs_scaled = coords_e[:, 0] * scale_factor
-            ys_scaled = coords_e[:, 1] * scale_factor
+            scaled_coords_xy = coords_e * scale_factor
+            xs_scaled = scaled_coords_xy[:, 0]
+            ys_scaled = scaled_coords_xy[:, 1]
             x_min, x_max = float(xs_scaled.min()), float(xs_scaled.max())
             y_min, y_max = float(ys_scaled.min()), float(ys_scaled.max())
             z_min, z_max = 0.0, thickness
-            st.write(f"• X span: {x_max - x_min:.3f} mm (from {x_min:.3f} to {x_max:.3f})")
-            st.write(f"• Y span: {y_max - y_min:.3f} mm (from {y_min:.3f} to {y_max:.3f})")
+            st.write(f"• X span: {x_max - x_min:.3f} mm   (from {x_min:.3f} to {x_max:.3f})")
+            st.write(f"• Y span: {y_max - y_min:.3f} mm   (from {y_min:.3f} to {y_max:.3f})")
             st.write(f"• Z span: {z_max - z_min:.3f} mm")
 
-            # 3) Optional: 2D resampled preview
-            st.subheader("Optional: Resampled Preview")
+            # 4) Optional: Resampled 2D preview
+            st.subheader("Optional: Resampled Preview (2D)")
             num_pts = st.slider(
                 "Resample points for smoothness",
                 min_value=50, max_value=500, value=300, step=10
             )
-            scaled_coords = coords_e * scale_factor
-            contour_preview = resample_profile_xy(scaled_coords, num_pts)
-            fig_e = plot_2d_profile(contour_preview, title="Resampled & Scaled (Preview)")
+            contour_preview = resample_profile_xy(scaled_coords_xy, num_pts)
+            fig_e = plot_2d_profile(contour_preview, title="Resampled & Scaled (2D)")
             st.pyplot(fig_e)
 
-            # 4) Let user choose (x_center, y_center) via sliders, show a red dot
+            # 5) Let user choose X, Y on that 2D plot, show a red marker
             st.subheader("Choose `x` and `y` for the Hex Center (in mm)")
             x_choice = st.slider(
-                "Hole center X [mm]", min_value=x_min, max_value=x_max,
-                value=(x_min + x_max) / 2.0, step=(x_max - x_min) / 1000.0
+                "Hole center X [mm]",
+                min_value=x_min,
+                max_value=x_max,
+                value=(x_min + x_max) / 2.0,
+                step=(x_max - x_min) / 1000.0
             )
             y_choice = st.slider(
-                "Hole center Y [mm]", min_value=y_min, max_value=y_max,
-                value=0.0, step=(y_max - y_min) / 1000.0
+                "Hole center Y [mm]",
+                min_value=y_min,
+                max_value=y_max,
+                value=(y_min + y_max) / 2.0,  # default to midpoint
+                step=(y_max - y_min) / 1000.0
             )
 
-            # Show the 2D contour again with a red marker at (x_choice, y_choice)
+            # Plot the 2D contour with a red dot at (x_choice, y_choice)
             fig2, ax2 = plt.subplots(figsize=(5, 2.5))
             ax2.plot(contour_preview[:, 0], contour_preview[:, 1], "-k", linewidth=2)
-            ax2.scatter([x_choice], [y_choice], c="red", s=50, label="Hex Center")
+            ax2.scatter([x_choice], [y_choice], c="red", s=60, label="Hex Center")
             ax2.set_aspect("equal", "box")
             ax2.set_xlabel("x [mm]")
             ax2.set_ylabel("y [mm]")
-            ax2.set_title("2D Airfoil with Chosen Hex Center")
+            ax2.set_title("2D Airfoil (with chosen Hex Center)")
             ax2.grid(True, linestyle="--", alpha=0.4)
             ax2.legend()
             st.pyplot(fig2)
 
-            # 5) Tapered‐hex parameters & depth
-            st.subheader("Tapered-Hex Hole Parameters")
-            colht, colhb, cold = st.columns(3)
-            with colht:
+            # 6) Tapered‐hex parameters (through thickness)
+            st.subheader("Tapered‐Hex Hole Parameters (Through Hole)")
+            col_ht, col_hb = st.columns(2)
+            with col_ht:
                 top_f2f = st.number_input(
-                    "Hex TOP flat-to-flat (mm)",
+                    "Hex TOP flat‐to‐flat [mm] (at z = thickness)",
                     min_value=0.5, value=5.0, step=0.1
                 )
-            with colhb:
+            with col_hb:
                 bot_f2f = st.number_input(
-                    "Hex BOTTOM flat-to-flat (mm)",
+                    "Hex BOTTOM flat‐to‐flat [mm] (at z = 0)",
                     min_value=0.1, value=4.8, step=0.1
                 )
-            with cold:
-                depth = st.number_input(
-                    "Hole DEPTH from top (mm)",
-                    min_value=0.0, max_value=thickness, value=thickness, step=0.1
-                )
 
-            # 6) Generate & Preview final STL
+            # 7) Generate & Preview final STL
             st.subheader("Generate & Preview STL")
             stl_name = st.text_input("Filename (no extension)", value="airfoil_extrusion")
             if not stl_name.strip():
                 st.error("Please enter a valid filename.")
             else:
-                if st.button("Create STL with Hex Hole"):
-                    # a) Build the extruded foil mesh
+                if st.button("Create STL with Through‐Hole Hex"):
+                    # a) Build the extruded foil mesh from z=0..thickness
                     verts_foil, faces_foil = extrude_to_vertices_faces(
-                        scaled_coords, thickness, num_interp=num_pts
+                        scaled_coords_xy, thickness, num_interp=num_pts
                     )
 
-                    # b) Remove + Insert hex from z = thickness - depth .. thickness
-                    verts_mod, faces_mod = slice_and_insert_hex(
-                        verts_foil,
-                        faces_foil,
-                        x_center=x_choice,
-                        y_center=y_choice,
-                        f2f_top=top_f2f,
-                        f2f_bot=bot_f2f,
-                        depth=depth,
-                        thickness=thickness
+                    # b) Drill a through‐hole: remove any triangle whose vertices lie
+                    #    in a small vertical column around (x_choice, y_choice),
+                    #    for all z ∈ [0, thickness].
+                    tol = 1e-6
+                    mask_slice = (
+                        (np.abs(verts_foil[:, 0] - x_choice) < tol) &
+                        (np.abs(verts_foil[:, 1] - y_choice) < tol) &
+                        (verts_foil[:, 2] >= 0.0 - tol) &
+                        (verts_foil[:, 2] <= thickness + tol)
+                    )
+                    slice_verts = np.nonzero(mask_slice)[0]
+
+                    keep_faces = []
+                    for tri in faces_foil:
+                        if any(v in slice_verts for v in tri):
+                            continue
+                        keep_faces.append(tri)
+                    keep_faces = np.array(keep_faces, dtype=int)
+
+                    # c) Build a “unit” hex prism from z=0..thickness (x=0,y=0)
+                    verts_hex_unit, faces_hex_unit = build_unit_hex_prism(
+                        top_f2f, bot_f2f, thickness
                     )
 
-                    # c) Generate ASCII STL text
-                    stl_text = write_stl_ascii(verts_mod, faces_mod, solid_name=stl_name)
+                    # d) Translate hex vertices to (x_choice, y_choice, z)
+                    verts_hex = verts_hex_unit.copy()
+                    verts_hex[:, 0] += x_choice
+                    verts_hex[:, 1] += y_choice
+                    # Note: hex unit already goes from z=0..thickness
+
+                    # e) Append the 12 hex vertices to the foil vertex list
+                    n_old = verts_foil.shape[0]
+                    verts_new = np.vstack([verts_foil, verts_hex])  # shape = (n_old+12, 3)
+
+                    # f) Reindex hex faces by +n_old
+                    faces_hex = faces_hex_unit + n_old
+
+                    # g) Combine kept foil faces + new hex faces
+                    faces_new = np.vstack([keep_faces, faces_hex])
+
+                    # h) Generate ASCII STL text
+                    stl_text = write_stl_ascii(verts_new, faces_new, solid_name=stl_name)
                     stl_bytes = stl_text.encode("utf-8")
 
-                    # d) Three.js preview of modified mesh
+                    # i) Three.js preview of final mesh
                     b64 = base64.b64encode(stl_bytes).decode()
                     html = f"""
                     <!DOCTYPE html>
@@ -572,7 +603,7 @@ with tab2:
                     """
                     st.components.v1.html(html, height=420)
 
-                    # e) Download button
+                    # j) Download button
                     st.download_button(
                         label="Download `.stl`",
                         data=stl_bytes,
